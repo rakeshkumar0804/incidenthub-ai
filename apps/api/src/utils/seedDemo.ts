@@ -1,5 +1,5 @@
+import type { PrismaClient } from '@prisma/client';
 import {
-  PrismaClient,
   OrgRole,
   IncidentSeverity,
   IncidentStatus,
@@ -22,6 +22,7 @@ import {
   IntegrationProvider,
   IntegrationStatus,
 } from '@prisma/client';
+
 import bcrypt from 'bcryptjs';
 
 export async function runDemoSeeding(prisma: PrismaClient): Promise<{
