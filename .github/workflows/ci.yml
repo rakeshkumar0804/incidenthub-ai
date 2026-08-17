@@ -25,11 +25,10 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U incidenthub -d incidenthub_test"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-
       redis:
         image: redis:7-alpine
         ports:
@@ -66,8 +65,9 @@ jobs:
       - name: Build — shared package
         run: npm run build -w packages/shared
 
-      - name: Run database migrations
-        run: npm run db:migrate:deploy
+      - name: Push database schema
+        run: npm run db:push
+
 
       - name: Typecheck — shared package
         run: npm run typecheck -w packages/shared
