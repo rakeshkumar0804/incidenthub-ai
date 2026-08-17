@@ -217,4 +217,17 @@ export class AuthController {
       next(error);
     }
   }
+
+  static async seedDemo(_req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const result = await AuthService.seedDemoData();
+      res.status(200).json({
+        success: true,
+        data: result,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
 }
+

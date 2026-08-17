@@ -601,4 +601,10 @@ export class AuthService {
       organizations: updatedUser.organizationMembers.map(formatOrgMemberDto),
     };
   }
+
+  static async seedDemoData(): Promise<unknown> {
+    const { runDemoSeeding } = await import('../../utils/seedDemo');
+    return runDemoSeeding(prisma);
+  }
 }
+

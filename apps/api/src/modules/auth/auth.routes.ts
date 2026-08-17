@@ -46,6 +46,11 @@ router.post('/dev-reset-viewer', (req, res, next) => {
   void AuthController.devResetViewer(req, res, next);
 });
 
+router.post('/seed-demo', (req, res, next) => {
+  void AuthController.seedDemo(req, res, next);
+});
+
+
 // Protected endpoints
 router.get(
   '/me',
