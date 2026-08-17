@@ -33,14 +33,20 @@ export function LoginPage() {
       }
     } catch (err: unknown) {
       if (typeof err === 'object' && err !== null && 'response' in err) {
-        const resErr = err as { response?: { data?: { error?: { message?: string } } } };
-        setErrorMessage(resErr.response?.data?.error?.message || 'Failed to log in. Please check credentials.');
+        const resErr = err as { response?: { data?: { error?: { message?: string } } | string } };
+        const data = resErr.response?.data;
+        const msg =
+          typeof data === 'object' && data && 'error' in data && data.error?.message
+            ? data.error.message
+            : 'Invalid email or password. Please check your credentials.';
+        setErrorMessage(msg);
       } else {
         setErrorMessage('Network error. Failed to reach API server.');
       }
     } finally {
       setIsLoading(false);
     }
+
   };
 
   return (

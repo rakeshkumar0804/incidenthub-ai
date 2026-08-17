@@ -29,7 +29,7 @@ export function useIncidentSocket(incidentId: string | undefined): UseIncidentSo
 
     setStatus('connecting');
 
-    const socketUrl = (import.meta.env['VITE_API_URL'] as string | undefined) || 'http://localhost:4000';
+    const socketUrl = (import.meta.env['VITE_API_URL'] as string | undefined)?.replace(/\/+$/, '') || 'http://localhost:4000';
 
     const socket: Socket = io(socketUrl, {
       path: '/socket.io',

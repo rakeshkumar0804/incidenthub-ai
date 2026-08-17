@@ -1,4 +1,4 @@
-import axios from 'axios';
+import { apiClient } from '../lib/axios';
 import type {
   AnalyticsOverviewResponseDto,
   ServiceRankingDto,
@@ -8,20 +8,14 @@ import type {
   AnalyticsDrilldownResponseDto,
 } from '@incidenthub/shared';
 
-const API_URL = (import.meta.env['VITE_API_URL'] as string | undefined) || 'http://localhost:4000';
-
-const client = axios.create({
-  baseURL: `${API_URL}/api/v1`,
-  withCredentials: true,
-});
-
 export const analyticsService = {
   getOverview: async (
     organizationId: string,
     window: AnalyticsTimeWindow = '30d',
     refresh = false,
   ): Promise<AnalyticsOverviewResponseDto> => {
-    const res = await client.get<{
+    const res = await apiClient.get<{
+
       success: boolean;
       data: AnalyticsOverviewResponseDto;
     }>(`/organizations/${organizationId}/analytics/overview`, {
@@ -34,7 +28,7 @@ export const analyticsService = {
     organizationId: string,
     window: AnalyticsTimeWindow = '30d',
   ): Promise<ServiceRankingDto[]> => {
-    const res = await client.get<{
+    const res = await apiClient.get<{
       success: boolean;
       data: ServiceRankingDto[];
     }>(`/organizations/${organizationId}/analytics/services`, {
@@ -47,7 +41,7 @@ export const analyticsService = {
     organizationId: string,
     window: AnalyticsTimeWindow = '30d',
   ): Promise<DeploymentCorrelationDto[]> => {
-    const res = await client.get<{
+    const res = await apiClient.get<{
       success: boolean;
       data: DeploymentCorrelationDto[];
     }>(`/organizations/${organizationId}/analytics/deployments`, {
@@ -60,7 +54,7 @@ export const analyticsService = {
     organizationId: string,
     window: AnalyticsTimeWindow = '30d',
   ): Promise<EngineeringSignalDto[]> => {
-    const res = await client.get<{
+    const res = await apiClient.get<{
       success: boolean;
       data: EngineeringSignalDto[];
     }>(`/organizations/${organizationId}/analytics/intelligence-signals`, {
@@ -74,7 +68,7 @@ export const analyticsService = {
     metric: string,
     window: AnalyticsTimeWindow = '30d',
   ): Promise<AnalyticsDrilldownResponseDto> => {
-    const res = await client.get<{
+    const res = await apiClient.get<{
       success: boolean;
       data: AnalyticsDrilldownResponseDto;
     }>(`/organizations/${organizationId}/analytics/drilldown`, {

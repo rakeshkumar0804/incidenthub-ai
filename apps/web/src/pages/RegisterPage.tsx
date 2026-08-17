@@ -40,14 +40,20 @@ export function RegisterPage() {
       }
     } catch (err: unknown) {
       if (typeof err === 'object' && err !== null && 'response' in err) {
-        const resErr = err as { response?: { data?: { error?: { message?: string } } } };
-        setErrorMessage(resErr.response?.data?.error?.message || 'Registration failed.');
+        const resErr = err as { response?: { data?: { error?: { message?: string } } | string } };
+        const data = resErr.response?.data;
+        const msg =
+          typeof data === 'object' && data && 'error' in data && data.error?.message
+            ? data.error.message
+            : 'Registration failed. Please check the details and try again.';
+        setErrorMessage(msg);
       } else {
         setErrorMessage('Network error. Failed to reach API server.');
       }
     } finally {
       setIsLoading(false);
     }
+
   };
 
   return (
