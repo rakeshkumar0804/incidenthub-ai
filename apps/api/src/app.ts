@@ -21,13 +21,21 @@ export function createApp(): Application {
   );
   app.use(cookieParser());
 
-  const allowedOrigins = Array.from(
-    new Set([env.CLIENT_URL, 'http://localhost:5173', 'http://127.0.0.1:5173']),
-  );
-
   app.use(
     cors({
-      origin: allowedOrigins,
+      origin: (origin, callback) => {
+        if (
+          !origin ||
+          origin === env.CLIENT_URL ||
+          origin.endsWith('.vercel.app') ||
+          origin.startsWith('http://localhost:') ||
+          origin.startsWith('http://127.0.0.1:')
+        ) {
+          callback(null, true);
+        } else {
+          callback(null, false);
+        }
+      },
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
       allowedHeaders: ['Content-Type', 'Authorization', 'x-organization-id', 'X-Request-ID'],
@@ -35,6 +43,7 @@ export function createApp(): Application {
   );
 
   app.use(requestLogger);
+
   app.use(globalApiRateLimiter);
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true }));
