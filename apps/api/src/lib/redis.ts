@@ -157,10 +157,29 @@ export function ensureLocalRedisServer(): Promise<void> {
                 socket.write('$-1\r\n');
               }
             } else if (cmd === 'DEL') {
-              const delKey = tokens[1];
-              const deleted = delKey && store.delete(delKey) ? 1 : 0;
-              if (delKey) expiry.delete(delKey);
+              let deleted = 0;
+              for (let i = 1; i < tokens.length; i++) {
+                const delKey = tokens[i];
+                if (delKey && store.delete(delKey)) {
+                  expiry.delete(delKey);
+                  deleted++;
+                }
+              }
               socket.write(`:${deleted}\r\n`);
+            } else if (cmd === 'KEYS') {
+              const pattern = tokens[1] || '*';
+              const matching: string[] = [];
+              const regex = new RegExp('^' + pattern.replace(/[-/\\^$+?.()|[\]{}]/g, '\\$&').replace(/\*/g, '.*') + '$');
+              for (const [k] of store) {
+                if (!isExpired(k) && (pattern === '*' || regex.test(k))) {
+                  matching.push(k);
+                }
+              }
+              let resp = `*${matching.length}\r\n`;
+              for (const k of matching) {
+                resp += `$${Buffer.byteLength(k)}\r\n${k}\r\n`;
+              }
+              socket.write(resp);
             } else if (cmd === 'EXISTS') {
               const exKey = tokens[1];
               const exists = exKey && store.has(exKey) && !isExpired(exKey) ? 1 : 0;
@@ -243,7 +262,7 @@ export async function checkRedisHealth(): Promise<'connected' | 'disconnected'> 
  */
 export async function safeRedisGet(key: string): Promise<string | null> {
   try {
-    const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 200));
+    const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000));
     const getPromise = redis.get(key);
     return await Promise.race([getPromise, timeoutPromise]);
   } catch {
@@ -259,7 +278,8 @@ export async function safeRedisSet(key: string, value: string, ttlSeconds = 300)
     // Add 10% random TTL jitter
     const jitter = Math.floor(ttlSeconds * 0.1 * Math.random());
     const finalTtl = ttlSeconds + jitter;
-    await redis.set(key, value, 'EX', finalTtl);
+    const timeoutPromise = new Promise<void>((resolve) => setTimeout(() => resolve(), 2000));
+    await Promise.race([redis.set(key, value, 'EX', finalTtl), timeoutPromise]);
   } catch {
     // Silent degradation
   }
@@ -270,10 +290,14 @@ export async function safeRedisSet(key: string, value: string, ttlSeconds = 300)
  */
 export async function safeRedisDel(keyPattern: string): Promise<void> {
   try {
-    const keys = await redis.keys(keyPattern);
-    if (keys.length > 0) {
-      await redis.del(...keys);
-    }
+    const timeoutPromise = new Promise<void>((resolve) => setTimeout(() => resolve(), 2000));
+    const delTask = async () => {
+      const keys = await redis.keys(keyPattern);
+      if (keys.length > 0) {
+        await redis.del(...keys);
+      }
+    };
+    await Promise.race([delTask(), timeoutPromise]);
   } catch {
     // Silent degradation
   }

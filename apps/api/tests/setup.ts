@@ -1,6 +1,6 @@
 import { beforeAll, afterAll } from 'vitest';
 import { prisma } from '../src/lib/prisma';
-import { ensureLocalRedisServer, redis } from '../src/lib/redis';
+import { ensureLocalRedisServer } from '../src/lib/redis';
 
 beforeAll(async () => {
   await ensureLocalRedisServer();
@@ -9,7 +9,4 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await prisma.$disconnect();
-  if (redis.status === 'ready' || redis.status === 'connecting') {
-    await redis.quit();
-  }
 });
