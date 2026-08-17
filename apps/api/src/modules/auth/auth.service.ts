@@ -510,8 +510,8 @@ export class AuthService {
   }
 
   /**
-   * Development-only password recovery mechanism for existing VIEWER user (rakesh5566@company.com).
-   * Preserves existing organization, existing VIEWER membership, and updates password hash.
+   * Development-only password recovery mechanism for VIEWER user (rakesh5566@company.com).
+   * Ensures user exists, resets password, and guarantees VIEWER role in organization.
    */
   static async devResetViewerPassword(): Promise<{ message: string; user: UserDto; activeOrganizationId: string; organizations: OrgMemberDto[] }> {
     if (process.env['NODE_ENV'] === 'production') {
@@ -522,17 +522,71 @@ export class AuthService {
     const password = 'Password123!';
     const passwordHash = await hashPassword(password);
 
-    const user = await prisma.user.findUnique({
+    let user = await prisma.user.findUnique({
       where: { email },
     });
 
     if (!user) {
-      throw new NotFoundError('Viewer user rakesh5566@company.com not found');
+      user = await prisma.user.create({
+        data: {
+          email,
+          name: 'Rakesh Viewer',
+          passwordHash,
+          emailVerified: true,
+        },
+      });
+    } else {
+      user = await prisma.user.update({
+        where: { id: user.id },
+        data: { passwordHash, emailVerified: true },
+      });
     }
 
-    const updatedUser = await prisma.user.update({
+    let org = await prisma.organization.findFirst({
+      where: { slug: 'rakesh-org' },
+    });
+
+    if (!org) {
+      org = await prisma.organization.findFirst({
+        where: { name: "Rakesh's Org" },
+      });
+    }
+
+    if (!org) {
+      org = await prisma.organization.create({
+        data: {
+          name: "Rakesh's Org",
+          slug: 'rakesh-org',
+        },
+      });
+    }
+
+    const member = await prisma.organizationMember.findUnique({
+      where: {
+        organizationId_userId: {
+          organizationId: org.id,
+          userId: user.id,
+        },
+      },
+    });
+
+    if (!member) {
+      await prisma.organizationMember.create({
+        data: {
+          organizationId: org.id,
+          userId: user.id,
+          role: OrgRole.VIEWER,
+        },
+      });
+    } else {
+      await prisma.organizationMember.update({
+        where: { id: member.id },
+        data: { role: OrgRole.VIEWER },
+      });
+    }
+
+    const updatedUser = await prisma.user.findUniqueOrThrow({
       where: { id: user.id },
-      data: { passwordHash, emailVerified: true },
       include: {
         organizationMembers: {
           include: { organization: true },
@@ -540,12 +594,10 @@ export class AuthService {
       },
     });
 
-    const activeOrgId = updatedUser.organizationMembers[0]?.organizationId || '';
-
     return {
       message: 'Viewer password successfully reset in development environment',
       user: formatUserDto(updatedUser),
-      activeOrganizationId: activeOrgId,
+      activeOrganizationId: org.id,
       organizations: updatedUser.organizationMembers.map(formatOrgMemberDto),
     };
   }
