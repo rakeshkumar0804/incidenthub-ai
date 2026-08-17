@@ -327,7 +327,7 @@ export async function runDemoSeeding(prisma: PrismaClient): Promise<{
 
     // INCIDENT 2: SEV-2 RESOLVED
     const inc2Detected = daysAgo(3, 8, 30);
-    const inc2 = await prisma.incident.create({
+    await prisma.incident.create({
       data: {
         organizationId: org.id,
         projectId: coreApiProject.id,
@@ -349,7 +349,7 @@ export async function runDemoSeeding(prisma: PrismaClient): Promise<{
     });
 
     // INCIDENT 3: SEV-2 MITIGATING
-    const inc3 = await prisma.incident.create({
+    await prisma.incident.create({
       data: {
         organizationId: org.id,
         projectId: paymentProject.id,
@@ -368,6 +368,7 @@ export async function runDemoSeeding(prisma: PrismaClient): Promise<{
         createdAt: daysAgo(0, 5, 20),
       },
     });
+
 
     // INCIDENT 4: SEV-3 INVESTIGATING
     await prisma.incident.create({
