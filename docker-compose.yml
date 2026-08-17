@@ -1,0 +1,89 @@
+version: "3.9"
+
+# IncidentHub AI — Local Development Services
+#
+# Only infrastructure services run in Docker.
+# The API (apps/api) and Web (apps/web) run locally via npm run dev.
+#
+# Start:    npm run docker:up
+# Stop:     npm run docker:down
+# Reset:    npm run docker:reset  (destroys all data)
+# Logs:     npm run docker:logs
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 15
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: incidenthub_postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: incidenthub_dev
+      POSTGRES_USER: incidenthub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U incidenthub -d incidenthub_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - incidenthub_network
+
+  # ---------------------------------------------------------------------------
+  # Redis 7
+  # Used for: BullMQ job queues, session cache (Phase 2+)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: incidenthub_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks:
+      - incidenthub_network
+
+  # ---------------------------------------------------------------------------
+  # Redis Commander — Web UI for Redis inspection (development only)
+  # Access at: http://localhost:8081
+  # ---------------------------------------------------------------------------
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: incidenthub_redis_ui
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      REDIS_HOSTS: "local:redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - incidenthub_network
+    profiles:
+      - tools # Only starts with: docker compose --profile tools up
+
+volumes:
+  postgres_data:
+    name: incidenthub_postgres_data
+  redis_data:
+    name: incidenthub_redis_data
+
+networks:
+  incidenthub_network:
+    name: incidenthub_network
+    driver: bridge

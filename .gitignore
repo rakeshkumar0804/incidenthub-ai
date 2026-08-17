@@ -1,0 +1,60 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+
+# Prisma
+prisma/migrations/
+
+# Environment files — NEVER commit real secrets
+.env
+.env.*
+!.env.example
+
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Testing
+coverage/
+.nyc_output/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# TypeScript
+*.tsbuildinfo
+
+# Prisma generated client (regenerated on install)
+node_modules/.prisma/
+
+# Vite
+.vite/
+apps/web/dist/
+
+# OS
+.DS_Store
+ehthumbs.db
+Desktop.ini

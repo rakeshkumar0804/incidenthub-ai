@@ -1,0 +1,1295 @@
+// =============================================================================
+// IncidentHub AI — Prisma Schema
+// =============================================================================
+// Multi-tenant SaaS schema for an Engineering Incident Intelligence Platform.
+//
+// Tenant boundary: Organization
+// Every organization's data is completely isolated. No cross-org data leakage.
+//
+// Denormalization strategy:
+//   Incidents carry organizationId directly (not only through Project) so that
+//   all incident-level tenant-boundary queries avoid an extra join.
+//
+// Idempotency strategy:
+//   ExternalEvent has a @@unique([provider, externalId]) constraint so that
+//   duplicate webhook deliveries can never produce duplicate records.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+/// Role a User holds within a specific Organization.
+/// A user may hold different roles in different organizations.
+enum OrgRole {
+  OWNER     // Full control, cannot be removed, transfers on delete
+  ADMIN     // Can manage members, teams, projects, integrations
+  RESPONDER // Can create/manage incidents, cannot manage members
+  VIEWER    // Read-only access
+}
+
+/// Incident severity following standard SRE severity levels.
+enum IncidentSeverity {
+  SEV1 // Critical — major outage
+  SEV2 // High impact
+  SEV3 // Moderate impact
+  SEV4 // Low impact
+}
+
+/// Incident lifecycle status.
+enum IncidentStatus {
+  OPEN          // Newly created incident
+  INVESTIGATING // Active investigation
+  MITIGATING    // Mitigation in progress
+  RESOLVED      // Incident fully resolved
+}
+
+/// Target deployment environment.
+enum IncidentEnvironment {
+  PRODUCTION
+  STAGING
+  DEVELOPMENT
+}
+
+/// The system or actor that produced an IncidentEvent.
+enum EventSource {
+  USER   // A human team member
+  GITHUB // GitHub webhook or API
+  SENTRY // Sentry webhook or API
+  SLACK  // Slack event
+  SYSTEM // Internal automated action
+  AI     // AI investigation engine
+}
+
+/// Supported external integration providers.
+enum IntegrationProvider {
+  GITHUB
+  SENTRY
+  SLACK
+  JIRA
+}
+
+/// Connection state of an integration.
+enum IntegrationStatus {
+  CONNECTED    // OAuth complete, webhooks active
+  DISCONNECTED // Not yet connected or explicitly disconnected
+  ERROR        // Connection error — credentials invalid or webhook failing
+}
+
+/// Categorizes the type of evidence linked to an incident.
+enum EvidenceType {
+  GITHUB_COMMIT
+  GITHUB_PR
+  GITHUB_DEPLOYMENT
+  GITHUB_WORKFLOW_RUN
+  SENTRY_ERROR
+  SLACK_MESSAGE
+  TIMELINE_EVENT
+  HISTORICAL_INCIDENT
+  MANUAL
+}
+
+/// How the evidence was added.
+enum EvidenceSource {
+  CORRELATION_ENGINE // Auto-detected by the correlation engine
+  AI_SUGGESTED       // Suggested by the AI investigation engine
+  MANUAL             // Manually linked by a team member
+}
+
+/// State of an AI-generated postmortem document.
+enum PostmortemStatus {
+  DRAFT     // AI-generated draft, not yet reviewed
+  IN_REVIEW // Under review by the team
+  APPROVED  // Approved, may be published internally
+  PUBLISHED // Externally visible (Phase 3+)
+}
+
+/// State of a postmortem action item.
+enum ActionItemStatus {
+  OPEN
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+/// Priority of a postmortem action item.
+enum ActionItemPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// =============================================================================
+// CORE ENTITIES
+// =============================================================================
+
+/// A human user. Not tied to any specific organization at the model level —
+/// membership is expressed through OrganizationMember and TeamMember.
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  emailVerified Boolean  @default(false)
+  name          String
+  avatarUrl     String?
+  /// Hashed with bcrypt (Phase 2). Null for OAuth-only users.
+  passwordHash  String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relations
+  organizationMembers OrganizationMember[]
+  teamMembers         TeamMember[]
+  assignedIncidents   Incident[]           @relation("IncidentAssignee")
+  createdIncidents    Incident[]           @relation("IncidentCreator")
+  incidentEvents      IncidentEvent[]
+  comments            Comment[]
+  sessions            Session[]
+  verificationTokens  VerificationToken[]
+  passwordResetTokens PasswordResetToken[]
+  sentInvitations     Invitation[]         @relation("InvitedBy")
+  triggeredCorrelationRuns CorrelationRun[] @relation("TriggeredCorrelationRuns")
+  triggeredInvestigationRuns InvestigationRun[] @relation("TriggeredInvestigationRuns")
+  triggeredReplayRuns ReplayRun[] @relation("TriggeredReplayRuns")
+  triggeredPostmortemRuns PostmortemRun[] @relation("TriggeredPostmortemRuns")
+
+  @@index([email])
+  @@map("users")
+}
+
+/// An organization is the primary tenant boundary.
+/// All data within an organization is completely isolated from other organizations.
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  /// URL-safe unique identifier, e.g. "acme-corp"
+  slug      String   @unique
+  logoUrl   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  members        OrganizationMember[]
+  teams          Team[]
+  projects       Project[]
+  integrations   Integration[]
+  externalEvents ExternalEvent[]
+  invitations    Invitation[]
+  incidents      Incident[]
+  incidentEvents IncidentEvent[]
+  githubRepositories GitHubRepository[]
+  sentryIssues   SentryIssue[]
+  sentryRules    SentryRule[]
+  correlationRuns CorrelationRun[]
+  investigationRuns InvestigationRun[]
+  replayRuns     ReplayRun[]
+  postmortems    Postmortem[]
+  postmortemRuns PostmortemRun[]
+  analyticsSnapshots AnalyticsSnapshot[]
+  serviceReliabilityMetrics ServiceReliabilityMetric[]
+  externalReferences ExternalReference[]
+  integrationDeliveries IntegrationDelivery[]
+
+  @@index([slug])
+  @@map("organizations")
+}
+
+/// Membership join table: User ↔ Organization with role.
+/// A user can be a member of multiple organizations simultaneously,
+/// holding different roles in each.
+model OrganizationMember {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  role           OrgRole  @default(VIEWER)
+  joinedAt       DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// A user can only have one membership per organization.
+  @@unique([organizationId, userId])
+  @@index([userId])
+  @@index([organizationId])
+  @@map("organization_members")
+}
+
+/// A team within an organization. Examples: Frontend, Backend, DevOps, SRE.
+model Team {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  members      TeamMember[]
+  projects     Project[]
+
+  /// Team names must be unique within an organization.
+  @@unique([organizationId, name])
+  @@index([organizationId])
+  @@map("teams")
+}
+
+/// Membership join table: User ↔ Team.
+model TeamMember {
+  id       String   @id @default(cuid())
+  teamId   String
+  userId   String
+  joinedAt DateTime @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+  @@index([userId])
+  @@index([teamId])
+  @@map("team_members")
+}
+
+/// A project represents a product, service group, or monitored system.
+/// Examples: "Payment API", "Website", "Mobile App".
+model Project {
+  id             String        @id @default(cuid())
+  organizationId String
+  name           String
+  /// URL-safe slug, unique within the organization.
+  slug           String
+  description    String?
+  status         ProjectStatus @default(ACTIVE)
+  /// Optional association to an owning team.
+  teamId         String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  team         Team?        @relation(fields: [teamId], references: [id], onDelete: SetNull)
+  services     Service[]
+  incidents    Incident[]
+  githubRepositories GitHubRepository[]
+  sentryIssues SentryIssue[]
+  sentryRules  SentryRule[]
+
+  @@unique([organizationId, slug])
+  @@index([organizationId])
+  @@index([teamId])
+  @@map("projects")
+}
+
+/// A service is a deployable unit within a project.
+/// Examples: "payment-api", "auth-service", "frontend-cdn".
+/// Future: linked to GitHub repositories and Sentry projects.
+model Service {
+  id          String   @id @default(cuid())
+  projectId   String
+  name        String
+  /// URL-safe slug, unique within the project.
+  slug        String
+  description String?
+  /// GitHub repository URL (populated during Phase 7 integration).
+  repositoryUrl String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  incidents Incident[]
+  githubRepositories GitHubRepository[]
+  sentryIssues SentryIssue[]
+  sentryRules  SentryRule[]
+
+  @@unique([projectId, slug])
+  @@index([projectId])
+  @@map("services")
+}
+
+// =============================================================================
+// INCIDENT CORE
+// =============================================================================
+
+/// The central entity of the platform. Represents a production incident.
+///
+/// organizationId is denormalized here (also reachable via project) to allow
+/// fast O(1) tenant-boundary filtering on incident queries without a join.
+model Incident {
+  id             String              @id @default(cuid())
+  organizationId String
+  projectId      String
+  serviceId      String?
+  /// Human-readable sequential incident number per organization (e.g. 1 -> INC-0001).
+  number         Int
+  title          String
+  description    String?             @db.Text
+  severity       IncidentSeverity    @default(SEV3)
+  status         IncidentStatus      @default(OPEN)
+  environment    IncidentEnvironment @default(PRODUCTION)
+  detectedAt     DateTime            @default(now())
+  acknowledgedAt DateTime?
+  resolvedAt     DateTime?
+  createdById    String
+  assignedToId   String?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  project      Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  service      Service?           @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  createdBy    User               @relation("IncidentCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  assignee     User?              @relation("IncidentAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  events       IncidentEvent[]
+  comments     Comment[]
+  evidence     IncidentEvidence[]
+  postmortem   Postmortem?
+  correlationRuns CorrelationRun[]
+  investigationRuns InvestigationRun[]
+  replayRuns     ReplayRun[]
+  postmortemRuns PostmortemRun[]
+
+  /// Human-readable number must be unique within each organization.
+  @@unique([organizationId, number])
+  @@index([organizationId])
+  @@index([projectId])
+  @@index([serviceId])
+  @@index([status])
+  @@index([severity])
+  @@index([environment])
+  @@index([assignedToId])
+  @@index([createdAt])
+  @@index([organizationId, status])
+  @@index([organizationId, createdAt(sort: Desc)])
+  @@map("incidents")
+}
+
+/// Represents a discrete event that occurred during an incident's lifecycle.
+///
+/// This is the unified timeline system. Events from GitHub, Sentry, Slack,
+/// and human actions all produce IncidentEvents so the timeline is coherent.
+/// Avoid creating separate timeline systems per integration.
+model IncidentEvent {
+  id             String      @id @default(cuid())
+  incidentId     String
+  organizationId String
+  /// Null for system/automated events.
+  userId         String?
+  source         EventSource @default(SYSTEM)
+  /// Event type identifier, e.g. "INCIDENT_CREATED", "STATUS_CHANGED", "SEVERITY_CHANGED", etc.
+  type           String
+  /// Human-readable description of what happened.
+  message        String      @db.Text
+  /// Flexible metadata: previous/new values, external IDs, etc.
+  metadata       Json?
+  occurredAt     DateTime    @default(now())
+
+  incident     Incident     @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([incidentId])
+  @@index([organizationId])
+  // For timeline reconstruction: incident ordered by time
+  @@index([incidentId, occurredAt(sort: Asc)])
+  @@map("incident_events")
+}
+
+/// A comment on an incident. Supports threaded replies via parentId.
+model Comment {
+  id         String   @id @default(cuid())
+  incidentId String
+  userId     String
+  /// If set, this comment is a reply to parentId.
+  parentId   String?
+  content    String   @db.Text
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  incident Incident  @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent   Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: SetNull)
+  replies  Comment[] @relation("CommentReplies")
+
+  @@index([incidentId])
+  @@index([parentId])
+  @@map("comments")
+}
+
+// =============================================================================
+// INTEGRATIONS & EXTERNAL EVENTS
+// =============================================================================
+
+/// Represents an organization's connection to an external service.
+/// Sensitive credentials are encrypted at the application layer (Phase 7/8).
+/// This record is never exposed raw to the frontend — only status and metadata.
+model Integration {
+  id             String              @id @default(cuid())
+  organizationId String
+  provider       IntegrationProvider
+  status         IntegrationStatus   @default(DISCONNECTED)
+  /// AES-256-GCM encrypted JSON blob containing provider-specific credentials.
+  /// Encrypted/decrypted in the integration service layer, never in routes.
+  encryptedConfig String?            @db.Text
+  /// Non-sensitive metadata safe for frontend display (org name, project key, etc.)
+  metadata        Json?
+  lastSyncAt      DateTime?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  externalEvents ExternalEvent[]
+  githubRepositories GitHubRepository[]
+  sentryIssues   SentryIssue[]
+  externalReferences ExternalReference[]
+  integrationDeliveries IntegrationDelivery[]
+
+  /// Only one integration per provider per organization.
+  @@unique([organizationId, provider])
+  @@index([organizationId])
+  @@map("integrations")
+}
+
+/// A raw event received from an external provider (GitHub, Sentry, etc.).
+///
+/// Raw payloads are stored intact so they can be reprocessed if logic changes.
+/// The @@unique([provider, externalId]) constraint enforces idempotency —
+/// a duplicate webhook delivery for the same event will violate this constraint
+/// and be silently discarded rather than creating a duplicate record.
+model ExternalEvent {
+  id             String    @id @default(cuid())
+  organizationId String
+  integrationId  String?
+  /// Provider name: "github", "sentry", "slack", "jira"
+  provider       String
+  /// Provider's own unique event identifier (e.g. GitHub X-GitHub-Delivery header).
+  externalId     String
+  /// Event type (e.g. "push", "pull_request", "issue.created").
+  eventType      String
+  /// Complete raw webhook payload stored as JSON.
+  payload        Json
+  /// When the event occurred at the provider (extracted from payload).
+  occurredAt     DateTime
+  /// When IncidentHub received the webhook.
+  receivedAt     DateTime  @default(now())
+  /// Null means not yet processed. Set by the BullMQ worker on completion (Phase 2+).
+  processedAt    DateTime?
+
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  integration  Integration?     @relation(fields: [integrationId], references: [id], onDelete: SetNull)
+  evidence     IncidentEvidence[]
+
+  /// Idempotency constraint: same provider + externalId = same logical event.
+  @@unique([provider, externalId])
+  @@index([organizationId])
+  @@index([provider, eventType])
+  @@index([occurredAt(sort: Desc)])
+  /// Index for the BullMQ worker to find unprocessed events.
+  @@index([processedAt])
+  @@map("external_events")
+}
+
+// =============================================================================
+// =============================================================================
+// PHASE 8 ENUMS & CORRELATION MODELS
+// =============================================================================
+
+/// Status of a Correlation Engine execution run.
+enum CorrelationRunStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+/// Confidence tier derived from normalized correlation score.
+enum EvidenceConfidenceTier {
+  HIGH     // Confidence >= 0.80
+  MEDIUM   // 0.50 <= Confidence < 0.80
+  LOW      // 0.20 <= Confidence < 0.50
+}
+
+/// Trigger source for a correlation execution.
+enum CorrelationTriggerType {
+  AUTOMATIC_INCIDENT_CREATED
+  AUTOMATIC_INCIDENT_UPDATED
+  AUTOMATIC_SIGNAL_RECEIVED
+  MANUAL_REQUEST
+  RERUN_REQUEST
+}
+
+/// Tracks an execution session of the Correlation Engine for auditability and telemetry.
+model CorrelationRun {
+  id              String                 @id @default(cuid())
+  organizationId  String
+  incidentId      String
+  triggerType     CorrelationTriggerType @default(MANUAL_REQUEST)
+  status          CorrelationRunStatus   @default(RUNNING)
+  windowStart     DateTime
+  windowEnd       DateTime
+  candidateCount  Int                    @default(0)
+  correlatedCount Int                    @default(0)
+  isTruncated     Boolean                @default(false)
+  error           String?                @db.Text
+  triggeredById   String?
+  startedAt       DateTime               @default(now())
+  completedAt     DateTime?
+
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  incident     Incident           @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  user         User?              @relation("TriggeredCorrelationRuns", fields: [triggeredById], references: [id], onDelete: SetNull)
+  evidence     IncidentEvidence[]
+  investigationRuns InvestigationRun[]
+
+  @@index([organizationId])
+  @@index([incidentId, startedAt(sort: Desc)])
+  @@map("correlation_runs")
+}
+
+/// Represents a piece of information that supports an incident investigation.
+model IncidentEvidence {
+  id               String                  @id @default(cuid())
+  incidentId       String
+  correlationRunId String?
+  externalEventId  String?
+  type             EvidenceType
+  source           EvidenceSource          @default(MANUAL)
+  /// Non-null deterministic identity string for PostgreSQL unique index integrity
+  externalRefId    String                  @default("")
+  confidenceTier   EvidenceConfidenceTier?
+  title            String
+  description      String?                 @db.Text
+  url              String?
+  confidence       Float?                  // 0.00 to 1.00 normalized
+  /// Machine-readable correlation boolean flags
+  reasons          Json?                   // { temporalProximity: boolean, projectMatch: boolean, serviceMatch: boolean, environmentMatch: boolean, deploymentRelation: boolean, commitRelation: boolean, sentrySpike: boolean, workflowFailure: boolean }
+  scoreBreakdown   Json?                   // Detailed factor weights
+  metadata         Json?
+  acknowledgedAt   DateTime?
+  dismissedAt      DateTime?
+  dismissedById    String?
+  addedAt          DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+
+  incident       Incident        @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  correlationRun CorrelationRun? @relation(fields: [correlationRunId], references: [id], onDelete: SetNull)
+  externalEvent  ExternalEvent?  @relation(fields: [externalEventId], references: [id], onDelete: SetNull)
+
+  /// Composite Idempotency Index (PostgreSQL Non-Null Guaranteed)
+  @@unique([incidentId, type, externalRefId])
+  @@index([incidentId])
+  @@index([incidentId, confidenceTier])
+  @@index([correlationRunId])
+  @@map("incident_evidence")
+}
+
+// =============================================================================
+// POSTMORTEM & ACTION ITEMS
+// =============================================================================
+
+/// An incident postmortem container. One per incident.
+model Postmortem {
+  id              String           @id @default(cuid())
+  organizationId  String
+  incidentId      String           @unique
+  activeVersionId String?
+  status          PostmortemStatus @default(DRAFT)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  incident     Incident            @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  versions     PostmortemVersion[]
+  actionItems  ActionItem[]
+
+  @@index([organizationId])
+  @@index([status])
+  @@map("postmortems")
+}
+
+/// An immutable, versioned snapshot of an incident postmortem document.
+model PostmortemVersion {
+  id                  String           @id @default(cuid())
+  postmortemId        String
+  organizationId      String
+  incidentId          String
+  versionNumber       Int              @default(1)
+  status              PostmortemStatus @default(DRAFT)
+  isCurrent           Boolean          @default(true)
+  aiGenerated         Boolean          @default(false)
+  summary             String?          @db.Text
+  impact              String?          @db.Text // Normalized field name
+  incidentTimeline    String?          @db.Text
+  rootCause           String?          @db.Text
+  contributingFactors String?          @db.Text
+  detection           String?          @db.Text
+  resolution          String?          @db.Text
+  wentWell            String?          @db.Text
+  wentWrong           String?          @db.Text
+  uncertainty         String?          @db.Text
+  evidenceReferences Json?            // Validated source ID citations
+  correlationRunId   String?
+  investigationRunId String?
+  replayRunId        String?
+  providerName        String           @default("openai")
+  modelName           String           @default("gpt-4o")
+  promptTokens        Int              @default(0)
+  completionTokens    Int              @default(0)
+  totalTokens         Int              @default(0)
+  latencyMs           Int              @default(0)
+  schemaVersion       String           @default("v1.0")
+  createdById         String?
+  approvedById        String?
+  publishedById       String?
+  publishedAt         DateTime?
+  createdAt           DateTime         @default(now())
+
+  postmortem  Postmortem   @relation(fields: [postmortemId], references: [id], onDelete: Cascade)
+  actionItems ActionItem[]
+
+  @@unique([postmortemId, versionNumber])
+  @@index([organizationId])
+  @@index([incidentId])
+  @@index([status])
+  @@map("postmortem_versions")
+}
+
+/// An action item derived from a postmortem version.
+model ActionItem {
+  id                  String             @id @default(cuid())
+  organizationId      String
+  postmortemId        String
+  postmortemVersionId String?
+  incidentId          String
+  title               String
+  description         String?            @db.Text
+  status              ActionItemStatus   @default(OPEN)
+  priority            ActionItemPriority @default(MEDIUM)
+  assigneeId          String?
+  dueDate             DateTime?
+  jiraIssueId         String?
+  jiraIssueUrl        String?
+  createdById         String?
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  postmortem        Postmortem         @relation(fields: [postmortemId], references: [id], onDelete: Cascade)
+  postmortemVersion PostmortemVersion? @relation(fields: [postmortemVersionId], references: [id], onDelete: SetNull)
+
+  @@index([postmortemId])
+  @@index([postmortemVersionId])
+  @@index([organizationId])
+  @@index([status])
+  @@map("action_items")
+}
+
+// =============================================================================
+// AUTHENTICATION & SESSIONS (PHASE 2)
+// =============================================================================
+
+/// Active user session storing a hashed refresh token.
+///
+/// Hashing tokens ensures database leaks do not compromise active sessions.
+/// Token family UUID tracks refresh token rotation & detects token reuse attacks.
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  /// SHA-256 hash of the issued refresh token string.
+  tokenHash  String   @unique
+  /// Family UUID grouping rotated tokens derived from the initial login.
+  family     String
+  isRevoked  Boolean  @default(false)
+  expiresAt  DateTime
+  userAgent  String?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([family])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+/// Token for email verification link.
+model VerificationToken {
+  id        String   @id @default(cuid())
+  userId    String
+  /// SHA-256 hash of the verification token string.
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("verification_tokens")
+}
+
+/// Token for password reset link.
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  /// SHA-256 hash of the password reset token string.
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// =============================================================================
+// PHASE 3 ENUMS & INVITATIONS
+// =============================================================================
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+enum ProjectStatus {
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+/// Invitation to join an Organization.
+///
+/// Hashed token string stored securely in database. Token is single-use and expires.
+model Invitation {
+  id             String           @id @default(cuid())
+  organizationId String
+  email          String
+  role           OrgRole          @default(VIEWER)
+  /// SHA-256 hash of the cryptographically random invitation token.
+  tokenHash      String           @unique
+  invitedById    String
+  status         InvitationStatus @default(PENDING)
+  expiresAt      DateTime
+  createdAt      DateTime         @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invitedBy    User         @relation("InvitedBy", fields: [invitedById], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([email])
+  @@index([tokenHash])
+  @@map("invitations")
+}
+
+// =============================================================================
+// GITHUB INTEGRATION MODELS (PHASE 6)
+// =============================================================================
+
+model GitHubRepository {
+  id              String   @id @default(cuid())
+  organizationId  String
+  integrationId   String
+  githubRepoId    BigInt
+  name            String
+  fullName        String
+  owner           String
+  defaultBranch   String   @default("main")
+  url             String
+  description     String?  @db.Text
+  isPrivate       Boolean  @default(true)
+  language        String?
+  stargazersCount Int      @default(0)
+  forksCount      Int      @default(0)
+  pushedAt        DateTime?
+
+  projectId       String?
+  serviceId       String?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  integration  Integration  @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  project      Project?     @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  service      Service?     @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+
+  commits      GitHubCommit[]
+  pullRequests GitHubPullRequest[]
+  deployments  GitHubDeployment[]
+  workflows    GitHubWorkflowRun[]
+
+  @@unique([organizationId, githubRepoId])
+  @@index([organizationId])
+  @@index([projectId])
+  @@index([serviceId])
+  @@map("github_repositories")
+}
+
+model GitHubCommit {
+  id           String   @id @default(cuid())
+  repositoryId String
+  sha          String
+  authorName   String
+  authorEmail  String?
+  message      String   @db.Text
+  branch       String   @default("main")
+  url          String
+  committedAt  DateTime
+  createdAt    DateTime @default(now())
+
+  repository GitHubRepository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+
+  @@unique([repositoryId, sha])
+  @@index([repositoryId])
+  @@index([sha])
+  @@map("github_commits")
+}
+
+model GitHubPullRequest {
+  id           String    @id @default(cuid())
+  repositoryId String
+  number       Int
+  title        String
+  state        String    // open, closed, merged
+  author       String
+  branch       String
+  targetBranch String    @default("main")
+  url          String
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  mergedAt     DateTime?
+  closedAt     DateTime?
+
+  repository GitHubRepository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+
+  @@unique([repositoryId, number])
+  @@index([repositoryId])
+  @@index([state])
+  @@map("github_pull_requests")
+}
+
+model GitHubDeployment {
+  id           String   @id @default(cuid())
+  repositoryId String
+  deploymentId String
+  environment  String   @default("production")
+  state        String   @default("success") // success, failure, pending, in_progress
+  commitSha    String
+  creator      String
+  url          String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  repository GitHubRepository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+
+  @@unique([repositoryId, deploymentId])
+  @@index([repositoryId])
+  @@index([environment])
+  @@map("github_deployments")
+}
+
+model GitHubWorkflowRun {
+  id           String    @id @default(cuid())
+  repositoryId String
+  runId        String
+  name         String
+  event        String
+  status       String    // completed, in_progress, queued
+  conclusion   String?   // success, failure, cancelled, timed_out
+  branch       String
+  commitSha    String
+  url          String
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  repository GitHubRepository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+
+  @@unique([repositoryId, runId])
+  @@index([repositoryId])
+  @@index([conclusion])
+  @@map("github_workflow_runs")
+}
+
+// =============================================================================
+// SENTRY INTEGRATION MODELS (PHASE 7)
+// =============================================================================
+
+model SentryIssue {
+  id             String    @id @default(cuid())
+  organizationId String
+  integrationId  String
+  sentryIssueId  String
+  projectSlug    String
+  title          String
+  culprit        String?
+  level          String    @default("error")
+  userCount      Int       @default(1)
+  eventCount     Int       @default(1)
+  firstSeen      DateTime  @default(now())
+  lastSeen       DateTime  @default(now())
+  release        String?
+  environment    String    @default("production")
+  permalink      String?
+  stackTrace     String?   @db.Text
+
+  projectId      String?
+  serviceId      String?
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  integration  Integration  @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  project      Project?     @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  service      Service?     @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+
+  @@unique([organizationId, sentryIssueId])
+  @@index([organizationId])
+  @@index([projectId])
+  @@index([serviceId])
+  @@index([environment])
+  @@index([level])
+  @@map("sentry_issues")
+}
+
+model SentryRule {
+  id                 String           @id @default(cuid())
+  organizationId     String
+  name               String
+  environment        String?
+  minEventCount      Int              @default(10)
+  minUserCount       Int              @default(5)
+  levelFilter        String?
+  mappedSeverity     IncidentSeverity @default(SEV2)
+  autoCreateIncident Boolean          @default(false)
+
+  projectId          String?
+  serviceId          String?
+
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  project      Project?     @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  service      Service?     @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+  @@index([projectId])
+  @@index([serviceId])
+  @@map("sentry_rules")
+}
+
+// =============================================================================
+// PHASE 9 ENUMS & AI INVESTIGATION MODELS
+// =============================================================================
+
+/// Status of an AI Investigation Engine execution run.
+enum InvestigationStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+/// Confidence tier derived from AI investigation analysis.
+enum InvestigationConfidenceTier {
+  HIGH
+  MEDIUM
+  LOW
+  UNCERTAIN
+}
+
+/// Trigger source for an AI Investigation execution.
+enum InvestigationTriggerType {
+  AUTOMATIC_CORRELATION_COMPLETED
+  MANUAL_REQUEST
+  RERUN_REQUEST
+}
+
+/// Tracks an execution session of the AI Investigation Engine for auditability, telemetry, and evidence-grounded root cause analysis.
+model InvestigationRun {
+  id                       String                       @id @default(cuid())
+  organizationId           String
+  incidentId               String
+  correlationRunId         String?
+  status                   InvestigationStatus          @default(RUNNING)
+  triggerType              InvestigationTriggerType     @default(MANUAL_REQUEST)
+  confidenceTier           InvestigationConfidenceTier?
+  confidence               Float?
+
+  incidentSummary          String?                      @db.Text
+  probableRootCause        String?                      @db.Text
+  supportingEvidence       Json?
+  contradictoryEvidence    Json?
+  alternativeHypotheses    Json?
+  impactAssessment         String?                      @db.Text
+  riskAssessment           String?                      @db.Text
+  recommendedActions       Json?
+  uncertainty              Json?
+  investigationLimitations String?                      @db.Text
+
+  providerName             String                       @default("openai")
+  modelName                String                       @default("gpt-4o")
+  promptTokens             Int                          @default(0)
+  completionTokens         Int                          @default(0)
+  totalTokens              Int                          @default(0)
+  latencyMs                Int                          @default(0)
+  validationError          String?                      @db.Text
+
+  triggeredById            String?
+  startedAt                DateTime                     @default(now())
+  completedAt              DateTime?
+
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  incident       Incident        @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  correlationRun CorrelationRun? @relation(fields: [correlationRunId], references: [id], onDelete: SetNull)
+  triggeredBy    User?           @relation("TriggeredInvestigationRuns", fields: [triggeredById], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+  @@index([incidentId, startedAt(sort: Desc)])
+  @@index([status])
+  @@map("investigation_runs")
+}
+
+// =============================================================================
+// Phase 10 — Incident Replay Engine
+// =============================================================================
+
+/// Execution status of an Incident Replay run.
+enum ReplayRunStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+/// Trigger source for Incident Replay execution.
+enum ReplayTriggerType {
+  AUTOMATIC_INCIDENT_RESOLVED
+  MANUAL_REQUEST
+  RERUN_REQUEST
+}
+
+/// Categorizes events for UI filtering and deterministic tie-breaking.
+enum ReplayCategory {
+  STATE_CHANGE   // System & Human incident state modifications (Weight 10)
+  TELEMETRY      // GitHub activity & Sentry error signals (Weight 20)
+  CORRELATION    // Phase 8 correlation execution milestones (Weight 30)
+  INVESTIGATION  // Phase 9 AI investigation lifecycle milestones (Weight 30)
+  COMMUNICATION  // Team discussion comments and replies (Weight 40)
+}
+
+/// Tracks an Incident Replay execution run.
+model ReplayRun {
+  id              String            @id @default(cuid())
+  organizationId  String
+  incidentId      String
+  triggerType     ReplayTriggerType @default(MANUAL_REQUEST)
+  status          ReplayRunStatus   @default(RUNNING)
+  windowStart     DateTime
+  windowEnd       DateTime
+  totalEventCount Int               @default(0)
+  isTruncated     Boolean           @default(false)
+  error           String?           @db.Text
+  triggeredById   String?
+  startedAt       DateTime          @default(now())
+  completedAt     DateTime?
+
+  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  incident     Incident      @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  triggeredBy  User?         @relation("TriggeredReplayRuns", fields: [triggeredById], references: [id], onDelete: SetNull)
+  events       ReplayEvent[]
+
+  @@index([organizationId])
+  @@index([incidentId, startedAt(sort: Desc)])
+  @@index([status])
+  @@map("replay_runs")
+}
+
+/// A single normalized, chronologically ordered event in an Incident Replay run.
+model ReplayEvent {
+  id             String         @id @default(cuid())
+  replayRunId    String
+  incidentId     String
+  organizationId String
+  sequenceIndex  Int            // 1-indexed deterministic sequence position
+  category       ReplayCategory
+  categoryWeight Int            @default(10) // Tie-breaker weight for identical timestamps
+  eventType      String
+  source         EventSource    @default(SYSTEM)
+  sourceEventId  String         // Deterministic composite ID: sourceTable:sourceId:eventType:subIndex
+  timestamp      DateTime
+  actorName      String?
+  actorEmail     String?
+  title          String
+  description    String?        @db.Text
+  externalUrl    String?
+  evidenceId     String?
+  metadata       Json?
+
+  replayRun ReplayRun @relation(fields: [replayRunId], references: [id], onDelete: Cascade)
+
+  @@unique([replayRunId, sequenceIndex])
+  @@unique([replayRunId, sourceEventId])
+  @@index([incidentId, timestamp])
+  @@index([organizationId])
+  @@map("replay_events")
+}
+
+// =============================================================================
+// Phase 11 — AI Postmortem Engine Audit Models
+// =============================================================================
+
+/// Trigger source for AI Postmortem generation.
+enum PostmortemTriggerType {
+  AUTOMATIC_INCIDENT_RESOLVED
+  MANUAL_REQUEST
+  REGENERATE_REQUEST
+}
+
+/// Audit log for an AI Postmortem generation execution run.
+model PostmortemRun {
+  id               String                 @id @default(cuid())
+  organizationId   String
+  incidentId       String
+  postmortemId     String?
+  triggerType      PostmortemTriggerType  @default(MANUAL_REQUEST)
+  status           InvestigationStatus    @default(RUNNING)
+  providerName     String                 @default("openai")
+  modelName        String                 @default("gpt-4o")
+  promptTokens     Int                    @default(0)
+  completionTokens Int                    @default(0)
+  totalTokens      Int                    @default(0)
+  latencyMs        Int                    @default(0)
+  error            String?                @db.Text
+  triggeredById    String?
+  startedAt        DateTime               @default(now())
+  completedAt      DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  incident     Incident     @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  triggeredBy  User?        @relation("TriggeredPostmortemRuns", fields: [triggeredById], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+  @@index([incidentId, startedAt(sort: Desc)])
+  @@index([status])
+  @@map("postmortem_runs")
+}
+
+// =============================================================================
+// Phase 12 — Analytics + Engineering Intelligence Models
+// =============================================================================
+
+/// Derived, rebuildable analytics snapshot for organization dashboard views.
+model AnalyticsSnapshot {
+  id              String   @id @default(cuid())
+  organizationId  String
+  timeWindow      String   // "24h", "7d", "30d", "90d", "custom"
+  periodStart     DateTime
+  periodEnd       DateTime
+  totalIncidents  Int      @default(0)
+  sev1Count       Int      @default(0)
+  sev2Count       Int      @default(0)
+  sev3Count       Int      @default(0)
+  sev4Count       Int      @default(0)
+  mttdMs          Float?
+  mttrMs          Float?
+  cfrPercent      Float?
+  metricsJson     Json     // Time-series buckets & detailed metrics
+  calculatedAt    DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, timeWindow, periodStart, periodEnd])
+  @@index([organizationId])
+  @@map("analytics_snapshots")
+}
+
+/// Derived, rebuildable service-level reliability metrics.
+model ServiceReliabilityMetric {
+  id              String   @id @default(cuid())
+  organizationId  String
+  serviceId       String
+  timeWindow      String   // "24h", "7d", "30d", "90d", "custom"
+  periodStart     DateTime
+  periodEnd       DateTime
+  totalIncidents  Int      @default(0)
+  sev1Count       Int      @default(0)
+  mttrMs          Float?
+  mttdMs          Float?
+  cfrPercent      Float?
+  calculatedAt    DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, serviceId, timeWindow, periodStart, periodEnd])
+  @@index([organizationId])
+  @@index([serviceId])
+  @@map("service_reliability_metrics")
+}
+
+// =============================================================================
+// Phase 13 — Slack + Jira Integrations Models
+// =============================================================================
+
+/// Status lifecycle for asynchronous integration delivery attempts.
+enum IntegrationDeliveryStatus {
+  PENDING
+  PROCESSING
+  RETRYING
+  SUCCESS
+  FAILED
+  CANCELLED
+}
+
+/// Universal cross-system reference mapping IncidentHub entities to external provider resources.
+model ExternalReference {
+  id                   String              @id @default(cuid())
+  organizationId       String
+  integrationId        String
+  provider             IntegrationProvider
+  entityType           String              // "INCIDENT", "ACTION_ITEM", "POSTMORTEM", "SERVICE"
+  entityId             String              // Local IncidentHub record ID
+  externalResourceType String              // "SLACK_CHANNEL", "SLACK_MESSAGE", "JIRA_ISSUE"
+  externalId           String              // Slack channel ID, Slack message TS, Jira issue key/ID
+  externalUrl          String?             // Direct web URL
+  metadata             Json?               // Provider-specific metadata (sync correlation IDs, titles)
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  integration  Integration  @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, provider, entityType, entityId, externalResourceType, externalId])
+  @@index([organizationId])
+  @@index([provider, externalId])
+  @@map("external_references")
+}
+
+/// Audit log and retry queue for outbound external delivery attempts (Slack messages, Jira API calls).
+model IntegrationDelivery {
+  id             String                    @id @default(cuid())
+  organizationId String
+  integrationId  String
+  provider       IntegrationProvider
+  eventType      String                    // "slack.notification", "slack.channel_create", "jira.issue_create"
+  sanitizedBody  Json                      // Sanitized request metadata (secrets/tokens stripped)
+  status         IntegrationDeliveryStatus @default(PENDING)
+  attemptCount   Int                       @default(0)
+  lastError      String?                   @db.Text
+  nextRetryAt    DateTime?
+  createdAt      DateTime                  @default(now())
+  updatedAt      DateTime                  @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  integration  Integration  @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([status, nextRetryAt])
+  @@map("integration_deliveries")
+}
