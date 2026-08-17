@@ -606,5 +606,11 @@ export class AuthService {
     const { runDemoSeeding } = await import('../../utils/seedDemo');
     return runDemoSeeding(prisma);
   }
+
+  static async cleanDemoOrgs(): Promise<unknown> {
+    const { cleanupExtraOrganizations } = await import('../../utils/cleanupOrgs');
+    return cleanupExtraOrganizations(prisma);
+  }
 }
+
 

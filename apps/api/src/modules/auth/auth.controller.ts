@@ -229,5 +229,18 @@ export class AuthController {
       next(error);
     }
   }
+
+  static async cleanDemoOrgs(_req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const result = await AuthService.cleanDemoOrgs();
+      res.status(200).json({
+        success: true,
+        data: result,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
 }
+
 

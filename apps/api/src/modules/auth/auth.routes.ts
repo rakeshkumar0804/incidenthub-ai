@@ -50,6 +50,11 @@ router.post('/seed-demo', (req, res, next) => {
   void AuthController.seedDemo(req, res, next);
 });
 
+router.post('/clean-demo-orgs', (req, res, next) => {
+  void AuthController.cleanDemoOrgs(req, res, next);
+});
+
+
 
 // Protected endpoints
 router.get(
