@@ -53,6 +53,15 @@ function formatOrgMemberDto(member: {
   };
 }
 
+function sortOrganizationsPrioritizingAcme<T extends { organization: { slug: string; name: string } }>(orgs: T[]): T[] {
+  return [...orgs].sort((a, b) => {
+    if (a.organization.slug === 'acme-engineering' || a.organization.name === 'Acme Engineering') return -1;
+    if (b.organization.slug === 'acme-engineering' || b.organization.name === 'Acme Engineering') return 1;
+    return 0;
+  });
+}
+
+
 export class AuthService {
   /**
    * Registers a new user, creates their default Organization, sets them as OWNER,
@@ -130,11 +139,42 @@ export class AuthService {
       },
     });
 
+    // Auto-link newly registered user to Acme Engineering if present
+    const acmeOrg = await prisma.organization.findUnique({
+      where: { slug: 'acme-engineering' },
+    });
+
+    let acmeMember = null;
+    if (acmeOrg) {
+      acmeMember = await prisma.organizationMember.upsert({
+        where: {
+          organizationId_userId: {
+            organizationId: acmeOrg.id,
+            userId: result.user.id,
+          },
+        },
+        update: {},
+        create: {
+          organizationId: acmeOrg.id,
+          userId: result.user.id,
+          role: OrgRole.ADMIN,
+        },
+        include: { organization: true },
+      });
+    }
+
+    const allMembers = [
+      ...(acmeMember ? [acmeMember] : []),
+      result.member,
+    ];
+    const sortedMembers = sortOrganizationsPrioritizingAcme(allMembers);
+    const activeOrganizationId = sortedMembers[0]?.organizationId || result.member.organizationId;
+
     const authData: AuthResponseData = {
       user: formatUserDto(result.user),
       accessToken,
-      activeOrganizationId: result.member.organizationId,
-      organizations: [formatOrgMemberDto(result.member)],
+      activeOrganizationId,
+      organizations: sortedMembers.map(formatOrgMemberDto),
     };
 
     return {
@@ -184,13 +224,14 @@ export class AuthService {
       },
     });
 
-    const activeOrgId = user.organizationMembers[0]?.organizationId;
+    const sortedMembers = sortOrganizationsPrioritizingAcme(user.organizationMembers);
+    const activeOrgId = sortedMembers[0]?.organizationId;
 
     const authData: AuthResponseData = {
       user: formatUserDto(user),
       accessToken,
       activeOrganizationId: activeOrgId,
-      organizations: user.organizationMembers.map(formatOrgMemberDto),
+      organizations: sortedMembers.map(formatOrgMemberDto),
     };
 
     return {
@@ -198,6 +239,7 @@ export class AuthService {
       refreshToken,
     };
   }
+
 
   /**
    * Logs out user by revoking the refresh token session.
@@ -294,12 +336,15 @@ export class AuthService {
       throw new NotFoundError('User not found');
     }
 
+    const sortedMembers = sortOrganizationsPrioritizingAcme(user.organizationMembers);
+
     return {
       user: formatUserDto(user),
-      activeOrganizationId: user.organizationMembers[0]?.organizationId,
-      organizations: user.organizationMembers.map(formatOrgMemberDto),
+      activeOrganizationId: sortedMembers[0]?.organizationId,
+      organizations: sortedMembers.map(formatOrgMemberDto),
     };
   }
+
 
   /**
    * Generates password reset token.
