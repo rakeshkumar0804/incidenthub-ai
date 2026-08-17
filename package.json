@@ -35,7 +35,6 @@
     "eslint": "^8.57.0",
     "eslint-plugin-react": "^7.35.0",
     "eslint-plugin-react-hooks": "^4.6.2",
-    "ioredis": "^6.0.0",
     "redis-memory-server": "^0.17.1",
     "tsx": "^4.19.0",
     "typescript": "^5.5.4"
@@ -48,6 +47,7 @@
     "bcryptjs": "^3.0.3",
     "cookie-parser": "^1.4.7",
     "express-rate-limit": "^8.6.2",
+    "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.3",
     "prisma": "^5.18.0"
   },
