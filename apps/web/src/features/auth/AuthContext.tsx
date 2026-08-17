@@ -19,11 +19,12 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 function sortOrgs(orgs: OrgMemberDto[]): OrgMemberDto[] {
   return [...orgs].sort((a, b) => {
-    if (a.organization.slug === 'acme-engineering' || a.organization.name === 'Acme Engineering') return -1;
-    if (b.organization.slug === 'acme-engineering' || b.organization.name === 'Acme Engineering') return 1;
+    if (a.organization?.slug === 'acme-engineering' || a.organization?.name === 'Acme Engineering') return -1;
+    if (b.organization?.slug === 'acme-engineering' || b.organization?.name === 'Acme Engineering') return 1;
     return 0;
   });
 }
+
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<UserDto | null>(null);
