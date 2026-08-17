@@ -7,7 +7,9 @@ import {
   linkIncidentActivitySchema,
 } from './github.schema';
 import { ValidationError, UnauthorizedError } from '../../../utils/errors';
+import { logger } from '../../../utils/logger';
 import type { ApiSuccess } from '@incidenthub/shared';
+
 
 export class GitHubController {
   public static async getIntegration(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -41,7 +43,9 @@ export class GitHubController {
       );
 
       // Auto-sync repositories after connecting
-      void GitHubService.syncRepositories(organizationId);
+      void GitHubService.syncRepositories(organizationId).catch((err: unknown) => {
+        logger.warn({ err, organizationId }, 'Background GitHub repo sync failed');
+      });
 
       const response: ApiSuccess<typeof integration> = {
         success: true,
@@ -69,7 +73,9 @@ export class GitHubController {
         req.user.id,
       );
 
-      void GitHubService.syncRepositories(organizationId);
+      void GitHubService.syncRepositories(organizationId).catch((err: unknown) => {
+        logger.warn({ err, organizationId }, 'Background GitHub repo sync failed');
+      });
 
       const response: ApiSuccess<typeof integration> = {
         success: true,
@@ -132,7 +138,10 @@ export class GitHubController {
       }
 
       const repo = await GitHubService.linkRepository(organizationId, repositoryId, parseResult.data);
-      void GitHubService.syncRepoActivity(repositoryId);
+      void GitHubService.syncRepoActivity(repositoryId).catch((err: unknown) => {
+        logger.warn({ err, repositoryId }, 'Background GitHub repo activity sync failed');
+      });
+
 
       const response: ApiSuccess<typeof repo> = {
         success: true,
