@@ -1,7 +1,9 @@
 import axios from 'axios';
 
+const apiBaseUrl = (import.meta.env['VITE_API_URL'] as string | undefined)?.replace(/\/+$/, '') || '';
+
 export const apiClient = axios.create({
-  baseURL: '/api/v1',
+  baseURL: apiBaseUrl ? `${apiBaseUrl}/api/v1` : '/api/v1',
   headers: {
     'Content-Type': 'application/json',
   },
@@ -10,6 +12,7 @@ export const apiClient = axios.create({
 });
 
 let isRefreshing = false;
+
 let failedQueue: Array<{ resolve: (token: string) => void; reject: (error: unknown) => void }> = [];
 
 const processQueue = (error: unknown, token: string | null = null) => {
