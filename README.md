@@ -1,4 +1,4 @@
-# IncidentHub 
+# IncidentHub AI
 
 **Engineering Incident Intelligence Platform** — correlates GitHub activity, Sentry errors, and team actions to deliver evidence-backed root-cause analysis and AI-generated postmortems.
 
