@@ -27,9 +27,18 @@ export function useIncidentSocket(incidentId: string | undefined): UseIncidentSo
       return;
     }
 
-    setStatus('connecting');
+    const getSocketUrl = (): string => {
+      const envUrl = (import.meta.env['VITE_API_URL'] as string | undefined)?.replace(/\/+$/, '');
+      if (envUrl) {
+        return envUrl;
+      }
+      if (typeof window !== 'undefined' && window.location.hostname.includes('vercel.app')) {
+        return 'https://incidenthub-ai.onrender.com';
+      }
+      return 'http://localhost:4000';
+    };
 
-    const socketUrl = (import.meta.env['VITE_API_URL'] as string | undefined)?.replace(/\/+$/, '') || 'http://localhost:4000';
+    const socketUrl = getSocketUrl();
 
     const socket: Socket = io(socketUrl, {
       path: '/socket.io',

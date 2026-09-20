@@ -30,9 +30,32 @@ export function getIO(): Server {
 }
 
 export function initSocketServer(httpServer: HttpServer): Server {
+  const allowedOrigins = new Set<string>();
+  if (env.CLIENT_URL) {
+    allowedOrigins.add(env.CLIENT_URL.replace(/\/$/, ''));
+  }
+  if (env.CORS_ALLOWED_ORIGINS) {
+    env.CORS_ALLOWED_ORIGINS.split(',')
+      .map((o) => o.trim().replace(/\/$/, ''))
+      .filter(Boolean)
+      .forEach((o) => allowedOrigins.add(o));
+  }
+  allowedOrigins.add('https://incidenthub-ai-web.vercel.app');
+
   const io = new Server(httpServer, {
     cors: {
-      origin: env.CLIENT_URL,
+      origin: (origin, callback) => {
+        if (!origin) return callback(null, true);
+        const normalized = origin.replace(/\/$/, '');
+        if (
+          allowedOrigins.has(normalized) ||
+          origin.startsWith('http://localhost:') ||
+          origin.startsWith('http://127.0.0.1:')
+        ) {
+          return callback(null, true);
+        }
+        callback(null, false);
+      },
       credentials: true,
       methods: ['GET', 'POST'],
     },

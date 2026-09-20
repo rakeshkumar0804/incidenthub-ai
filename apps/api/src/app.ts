@@ -44,6 +44,7 @@ export function createApp(): Application {
       .filter(Boolean)
       .forEach((o) => allowedOrigins.add(o));
   }
+  allowedOrigins.add('https://incidenthub-ai-web.vercel.app');
 
   app.use(
     cors({

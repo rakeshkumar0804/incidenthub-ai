@@ -1,6 +1,17 @@
 import axios from 'axios';
 
-const apiBaseUrl = (import.meta.env['VITE_API_URL'] as string | undefined)?.replace(/\/+$/, '') || '';
+const getApiBaseUrl = (): string => {
+  const envUrl = (import.meta.env['VITE_API_URL'] as string | undefined)?.replace(/\/+$/, '');
+  if (envUrl) {
+    return envUrl;
+  }
+  if (typeof window !== 'undefined' && window.location.hostname.includes('vercel.app')) {
+    return 'https://incidenthub-ai.onrender.com';
+  }
+  return '';
+};
+
+const apiBaseUrl = getApiBaseUrl();
 
 export const apiClient = axios.create({
   baseURL: apiBaseUrl ? `${apiBaseUrl}/api/v1` : '/api/v1',
