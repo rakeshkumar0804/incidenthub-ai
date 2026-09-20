@@ -17,15 +17,6 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-function sortOrgs(orgs: OrgMemberDto[]): OrgMemberDto[] {
-  return [...orgs].sort((a, b) => {
-    if (a.organization?.slug === 'acme-engineering' || a.organization?.name === 'Acme Engineering') return -1;
-    if (b.organization?.slug === 'acme-engineering' || b.organization?.name === 'Acme Engineering') return 1;
-    return 0;
-  });
-}
-
-
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<UserDto | null>(null);
   const [organizations, setOrganizations] = useState<OrgMemberDto[]>([]);
@@ -34,10 +25,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
   const applyAuthData = useCallback((data: AuthResponseData) => {
-    const sorted = sortOrgs(data.organizations || []);
     setUser(data.user);
-    setOrganizations(sorted);
-    const initialOrgId = data.activeOrganizationId || sorted[0]?.organizationId || null;
+    setOrganizations(data.organizations || []);
+    const initialOrgId = data.activeOrganizationId || data.organizations?.[0]?.organizationId || null;
     setActiveOrgIdState(initialOrgId);
     if (data.accessToken) {
       setAccessToken(data.accessToken);
@@ -56,10 +46,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       const { data } = await apiClient.get<ApiSuccess<{ user: UserDto; organizations: OrgMemberDto[]; activeOrganizationId?: string }>>('/auth/me');
       if (data.success) {
-        const sorted = sortOrgs(data.data.organizations || []);
         setUser(data.data.user);
-        setOrganizations(sorted);
-        setActiveOrgIdState(data.data.activeOrganizationId || sorted[0]?.organizationId || null);
+        setOrganizations(data.data.organizations || []);
+        setActiveOrgIdState(data.data.activeOrganizationId || data.data.organizations?.[0]?.organizationId || null);
       }
     } catch {
       setUser(null);
@@ -69,8 +58,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } finally {
       setIsLoading(false);
     }
-
   }, []);
+
 
   useEffect(() => {
     void refreshUser();

@@ -38,22 +38,6 @@ router.post('/resend-verification', (req, res, next) => {
   void AuthController.resendVerification(req, res, next);
 });
 
-router.post('/dev-restore-owner', (req, res, next) => {
-  void AuthController.devRestoreOwner(req, res, next);
-});
-
-router.post('/dev-reset-viewer', (req, res, next) => {
-  void AuthController.devResetViewer(req, res, next);
-});
-
-router.post('/seed-demo', (req, res, next) => {
-  void AuthController.seedDemo(req, res, next);
-});
-
-router.post('/clean-demo-orgs', (req, res, next) => {
-  void AuthController.cleanDemoOrgs(req, res, next);
-});
-
 
 
 // Protected endpoints

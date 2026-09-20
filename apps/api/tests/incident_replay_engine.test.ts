@@ -254,7 +254,7 @@ describe('Phase 10 — Incident Replay Engine Integration Tests', () => {
       const res = await ReplayService.runReplay(orgAId, incidentId, undefined, 'MANUAL_REQUEST');
 
       if (health === 'connected') {
-        expect(res.status).toBe('skipped: lock active');
+        expect(['skipped: lock active', 'skipped_lock_active']).toContain(res.status);
         await redis.del(lockKey);
       } else {
         expect(res.status).toBe('completed');

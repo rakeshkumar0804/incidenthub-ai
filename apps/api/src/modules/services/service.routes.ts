@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { ServiceController } from './service.controller';
 import { authenticate, requireAuth } from '../../middleware/auth';
+import { requireProjectPermission, requireServicePermission } from '../../middleware/resourceAuth';
 
 const projectServicesRouter = Router({ mergeParams: true });
 const rootServicesRouter = Router();
@@ -12,6 +13,9 @@ projectServicesRouter.get(
     void authenticate(req, res, next);
   },
   requireAuth,
+  (req, res, next) => {
+    void requireProjectPermission('projects:read')(req, res, next);
+  },
   (req, res, next) => {
     void ServiceController.list(req, res, next);
   },
@@ -25,6 +29,9 @@ projectServicesRouter.post(
   },
   requireAuth,
   (req, res, next) => {
+    void requireProjectPermission('projects:manage')(req, res, next);
+  },
+  (req, res, next) => {
     void ServiceController.create(req, res, next);
   },
 );
@@ -36,6 +43,9 @@ rootServicesRouter.get(
     void authenticate(req, res, next);
   },
   requireAuth,
+  (req, res, next) => {
+    void requireServicePermission('projects:read')(req, res, next);
+  },
   (req, res, next) => {
     void ServiceController.getById(req, res, next);
   },
@@ -49,6 +59,9 @@ rootServicesRouter.patch(
   },
   requireAuth,
   (req, res, next) => {
+    void requireServicePermission('projects:manage')(req, res, next);
+  },
+  (req, res, next) => {
     void ServiceController.update(req, res, next);
   },
 );
@@ -60,6 +73,9 @@ rootServicesRouter.delete(
     void authenticate(req, res, next);
   },
   requireAuth,
+  (req, res, next) => {
+    void requireServicePermission('projects:manage')(req, res, next);
+  },
   (req, res, next) => {
     void ServiceController.delete(req, res, next);
   },

@@ -1,6 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import { SlackService } from './slack.service';
-import { ValidationError } from '../../../utils/errors';
+import { ValidationError, UnauthorizedError } from '../../../utils/errors';
 import type { SlackInteractivePayload } from './slack.types';
 
 export class SlackController {
@@ -58,14 +58,14 @@ export class SlackController {
     try {
       const signature = typeof req.headers['x-slack-signature'] === 'string' ? req.headers['x-slack-signature'] : undefined;
       const timestamp = typeof req.headers['x-slack-request-timestamp'] === 'string' ? req.headers['x-slack-request-timestamp'] : undefined;
+      if (!signature || !timestamp) {
+        throw new UnauthorizedError('Missing Slack signature or timestamp');
+      }
 
-      if (process.env['NODE_ENV'] !== 'test' && signature) {
-        const rawBody: Buffer = typeof req.body === 'string' ? Buffer.from(req.body, 'utf8') : Buffer.from(JSON.stringify(req.body));
-        const isValid = SlackService.verifySlackSignature(rawBody, timestamp, signature);
-        if (!isValid) {
-          res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid Slack signature' } });
-          return;
-        }
+      const rawBody: Buffer = req.rawBody || (typeof req.body === 'string' ? Buffer.from(req.body, 'utf8') : Buffer.from(JSON.stringify(req.body)));
+      const isValid = SlackService.verifySlackSignature(rawBody, timestamp, signature);
+      if (!isValid) {
+        throw new UnauthorizedError('Invalid Slack signature');
       }
 
       const bodyObj = req.body as Record<string, unknown>;

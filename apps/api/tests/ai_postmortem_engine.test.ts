@@ -17,6 +17,7 @@ describe('Phase 11 — AI Postmortem Engine Integration Tests', () => {
   let projectId: string;
   let serviceId: string;
   let incidentId: string;
+  let ownerId: string;
 
   let responderToken: string;
   let viewerToken: string;
@@ -41,6 +42,7 @@ describe('Phase 11 — AI Postmortem Engine Integration Tests', () => {
     const owner = await prisma.user.create({
       data: { email: `pm-owner-${ts}@example.com`, name: 'PM Owner', passwordHash: 'hash' },
     });
+    ownerId = owner.id;
     const responder = await prisma.user.create({
       data: { email: `pm-resp-${ts}@example.com`, name: 'PM Responder', passwordHash: 'hash' },
     });
@@ -215,47 +217,50 @@ describe('Phase 11 — AI Postmortem Engine Integration Tests', () => {
   // =============================================================================
   describe('3. Human Review & Published Immutability', () => {
     it('allows responder to edit section content and transition lifecycle status to PUBLISHED', async () => {
-      const ownerUser = await prisma.user.findFirst({ where: { email: { startsWith: 'pm-owner-' } } });
-      const userId = ownerUser?.id || '';
+      const userId = ownerId;
+      const dataBefore = await PostmortemService.getPostmortem(orgAId, incidentId);
+      const v1Id = dataBefore.postmortem?.activeVersion?.id ?? '';
 
       // Edit section content
       const updated1 = await PostmortemService.updatePostmortemVersion(
         orgAId,
         incidentId,
-        { summary: 'Human edited executive summary.' },
+        { baseVersionId: v1Id, summary: 'Human edited executive summary.' },
         userId,
       );
       expect(updated1.summary).toBe('Human edited executive summary.');
 
       // Transition DRAFT -> IN_REVIEW -> APPROVED -> PUBLISHED
-      await PostmortemService.updatePostmortemVersion(orgAId, incidentId, { status: PostmortemStatus.IN_REVIEW }, userId);
-      await PostmortemService.updatePostmortemVersion(orgAId, incidentId, { status: PostmortemStatus.APPROVED }, userId);
-      const published = await PostmortemService.updatePostmortemVersion(orgAId, incidentId, { status: PostmortemStatus.PUBLISHED }, userId);
+      await PostmortemService.updatePostmortemVersion(orgAId, incidentId, { baseVersionId: updated1.id, status: PostmortemStatus.IN_REVIEW }, userId);
+      await PostmortemService.updatePostmortemVersion(orgAId, incidentId, { baseVersionId: updated1.id, status: PostmortemStatus.APPROVED }, userId);
+      const published = await PostmortemService.updatePostmortemVersion(orgAId, incidentId, { baseVersionId: updated1.id, status: PostmortemStatus.PUBLISHED }, userId);
 
       expect(published.status).toBe(PostmortemStatus.PUBLISHED);
       expect(published.publishedAt).toBeDefined();
     });
 
     it('editing a PUBLISHED postmortem creates a NEW DRAFT version (v2) to preserve published immutability', async () => {
-      const ownerUser = await prisma.user.findFirst({ where: { email: { startsWith: 'pm-owner-' } } });
-      const userId = ownerUser?.id || '';
+      const userId = ownerId;
+      const dataBefore = await PostmortemService.getPostmortem(orgAId, incidentId);
+      const pubId = dataBefore.postmortem?.activeVersion?.id ?? '';
 
       const v2 = await PostmortemService.updatePostmortemVersion(
         orgAId,
         incidentId,
-        { summary: 'Post-publication amendment for v2.' },
+        { baseVersionId: pubId, summary: 'Post-publication amendment for v2.' },
         userId,
       );
 
-      expect(v2.versionNumber).toBe(2);
+      expect(v2.versionNumber).toBe(3);
       expect(v2.status).toBe(PostmortemStatus.DRAFT);
       expect(v2.summary).toBe('Post-publication amendment for v2.');
 
-      // Verify v1 remains published and intact
+      // Verify previous published version remains published and intact
       const data = await PostmortemService.getPostmortem(orgAId, incidentId);
-      const v1 = data.postmortem?.versions.find((v) => v.versionNumber === 1);
-      expect(v1?.status).toBe(PostmortemStatus.PUBLISHED);
-      expect(v1?.summary).toBe('Human edited executive summary.');
+      const publishedVer = data.postmortem?.versions.find((v) => v.status === PostmortemStatus.PUBLISHED);
+      expect(publishedVer).toBeDefined();
+      expect(publishedVer?.versionNumber).toBe(2);
+      expect(publishedVer?.summary).toBe('Human edited executive summary.');
     });
   });
 
@@ -264,8 +269,7 @@ describe('Phase 11 — AI Postmortem Engine Integration Tests', () => {
   // =============================================================================
   describe('4. Action Items & REST API Endpoints', () => {
     it('creates and updates structured action items attached to postmortem', async () => {
-      const ownerUser = await prisma.user.findFirst({ where: { email: { startsWith: 'pm-owner-' } } });
-      const userId = ownerUser?.id || '';
+      const userId = ownerId;
 
       const item = await PostmortemService.createActionItem(
         orgAId,
@@ -277,7 +281,7 @@ describe('Phase 11 — AI Postmortem Engine Integration Tests', () => {
       expect(item.id).toBeDefined();
       expect(item.title).toBe('Add connection pool metrics panel');
 
-      const updated = await PostmortemService.updateActionItem(orgAId, item.id, { status: 'COMPLETED' });
+      const updated = await PostmortemService.updateActionItem(orgAId, incidentId, item.id, { status: 'COMPLETED' });
       expect(updated.status).toBe('COMPLETED');
     });
 
@@ -503,10 +507,10 @@ describe('Phase 11 — AI Postmortem Engine Integration Tests', () => {
 
       if (!item) return; // No items from current generation, skip
 
-      const updated = await PostmortemService.updateActionItem(testOrgId, item.id, { status: 'COMPLETED' });
+      const updated = await PostmortemService.updateActionItem(testOrgId, testIncidentId, item.id, { status: 'COMPLETED' });
       expect(updated.status).toBe('COMPLETED');
 
-      const reverted = await PostmortemService.updateActionItem(testOrgId, item.id, { status: 'OPEN' });
+      const reverted = await PostmortemService.updateActionItem(testOrgId, testIncidentId, item.id, { status: 'OPEN' });
       expect(reverted.status).toBe('OPEN');
     });
 

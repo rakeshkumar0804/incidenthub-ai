@@ -1,5 +1,7 @@
+import crypto from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { SentryService } from './sentry.service';
+import type { SentryWebhookPayload } from './sentry.service';
 import {
   connectSentryOAuthSchema,
   connectSentryTokenSchema,
@@ -112,12 +114,27 @@ export class SentryController {
 
   public static async handleWebhook(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const headerResource = req.headers['sentry-hook-resource'];
-      const headerDelivery = req.headers['x-sentry-delivery'];
-      const deliveryId =
-        (typeof headerResource === 'string' ? headerResource : undefined) ||
-        (typeof headerDelivery === 'string' ? headerDelivery : undefined) ||
-        `deliv-${Date.now()}`;
+      const headerDelivery =
+        (typeof req.headers['x-sentry-delivery'] === 'string' && req.headers['x-sentry-delivery'].trim()) ||
+        (typeof req.headers['sentry-delivery-id'] === 'string' && req.headers['sentry-delivery-id'].trim()) ||
+        (typeof req.headers['sentry-hook-id'] === 'string' && req.headers['sentry-hook-id'].trim()) ||
+        undefined;
+
+      const hookResource =
+        (typeof req.headers['sentry-hook-resource'] === 'string' && req.headers['sentry-hook-resource'].trim()) ||
+        (req.body as { action?: string })?.action ||
+        'event';
+
+      const rawBody = req.rawBody || (typeof req.body === 'string' ? Buffer.from(req.body, 'utf8') : Buffer.from(JSON.stringify(req.body)));
+
+      let deliveryId: string;
+      if (headerDelivery) {
+        deliveryId = headerDelivery;
+      } else {
+        const rawBuf = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(typeof rawBody === 'string' ? rawBody : JSON.stringify(req.body), 'utf8');
+        const digest = crypto.createHash('sha256').update(Buffer.concat([Buffer.from(`sentry:${hookResource}:`), rawBuf])).digest('hex');
+        deliveryId = `sentry-${digest}`;
+      }
 
       const headerSentrySig = req.headers['sentry-hook-signature'];
       const headerXSig = req.headers['x-sentry-signature'];
@@ -125,7 +142,12 @@ export class SentryController {
         (typeof headerSentrySig === 'string' ? headerSentrySig : undefined) ||
         (typeof headerXSig === 'string' ? headerXSig : undefined);
 
-      const result = await SentryService.handleWebhookEvent(deliveryId, signature, req.body);
+      const result = await SentryService.handleWebhookEvent(
+        deliveryId,
+        signature,
+        req.body as SentryWebhookPayload,
+        rawBody,
+      );
       const response: ApiSuccess<typeof result> = {
         success: true,
         data: result,

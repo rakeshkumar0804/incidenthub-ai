@@ -40,11 +40,12 @@ export class MemberController {
 
   static async remove(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
+      if (!req.user) throw new UnauthorizedError('Authentication required');
       const orgId = req.params['organizationId'];
       const memberId = req.params['memberId'];
       if (!orgId || !memberId) return;
 
-      const result = await MemberService.removeMember(orgId, memberId);
+      const result = await MemberService.removeMember(orgId, memberId, req.user.id);
 
       res.status(200).json({
         success: true,

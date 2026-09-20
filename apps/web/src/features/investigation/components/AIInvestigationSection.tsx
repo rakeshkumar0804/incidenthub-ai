@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import type { InvestigationRunDto } from '@incidenthub/shared';
+import type { InvestigationRunDto, LatestInvestigationFailureDto } from '@incidenthub/shared';
 import { investigationService } from '../../../services/investigationService';
 
 interface AIInvestigationSectionProps {
@@ -14,6 +14,8 @@ export const AIInvestigationSection: React.FC<AIInvestigationSectionProps> = ({
 }) => {
   const queryClient = useQueryClient();
   const [latestRun, setLatestRun] = useState<InvestigationRunDto | null>(null);
+  const [latestCompletedRun, setLatestCompletedRun] = useState<InvestigationRunDto | null>(null);
+  const [latestFailure, setLatestFailure] = useState<LatestInvestigationFailureDto | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -29,6 +31,8 @@ export const AIInvestigationSection: React.FC<AIInvestigationSectionProps> = ({
       const data = await investigationService.getLatestInvestigation(organizationId, incidentId);
       if (gen !== fetchGenRef.current) return;
       setLatestRun(data.latestRun);
+      setLatestCompletedRun(data.latestCompletedRun);
+      setLatestFailure(data.latestFailure);
     } catch (err: unknown) {
       if (gen !== fetchGenRef.current) return;
       const msg = err instanceof Error ? err.message : 'Failed to fetch AI investigation';
@@ -74,6 +78,8 @@ export const AIInvestigationSection: React.FC<AIInvestigationSectionProps> = ({
     }
   };
 
+  const activeRun = latestCompletedRun || latestRun;
+
   return (
     <div className="rounded-2xl border border-purple-500/20 bg-purple-500/[0.02] p-6 shadow-xl backdrop-blur-sm">
       {/* Header */}
@@ -87,17 +93,22 @@ export const AIInvestigationSection: React.FC<AIInvestigationSectionProps> = ({
           <div>
             <div className="flex items-center gap-2">
               <h2 className="text-lg font-bold text-white">AI Investigation Engine</h2>
-              {latestRun?.confidenceTier && (
-                <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold border ${getTierBadge(latestRun.confidenceTier)}`}>
-                  {latestRun.confidenceTier} CONFIDENCE ({Math.round((latestRun.confidence || 0) * 100)}%)
+              {activeRun?.confidenceTier && (
+                <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold border ${getTierBadge(activeRun.confidenceTier)}`}>
+                  {activeRun.confidenceTier} GROUNDING ({Math.round((activeRun.confidence || 0) * 100)}%)
+                </span>
+              )}
+              {activeRun?.providerName && (
+                <span className="rounded-full px-2 py-0.5 text-[10px] font-medium border border-white/10 bg-white/5 text-gray-300">
+                  {activeRun.providerName === 'openai' ? `OpenAI (${activeRun.modelName})` : 'Offline Fallback'}
                 </span>
               )}
             </div>
             <p className="text-xs text-gray-400">
-              Evidence-grounded root cause analysis, risk evaluation &amp; mitigation steps.
-              {latestRun?.completedAt && (
+              Evidence-grounded root-cause hypothesis, risk evaluation &amp; mitigation steps.
+              {activeRun?.completedAt && (
                 <span className="ml-1 text-gray-500">
-                  Last generated: {new Date(latestRun.completedAt).toLocaleTimeString()}
+                  Last generated: {new Date(activeRun.completedAt).toLocaleTimeString()}
                 </span>
               )}
             </p>
@@ -129,10 +140,27 @@ export const AIInvestigationSection: React.FC<AIInvestigationSectionProps> = ({
       {/* Error Alert Banner */}
       {errorMsg && (
         <div className="mb-4 flex items-center justify-between rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-400">
-          <span>AI investigation failed: {errorMsg}</span>
+          <span>AI investigation request failed: {errorMsg}</span>
           <button type="button" onClick={() => setErrorMsg(null)} className="ml-2 font-bold text-red-400 hover:text-white">
             ✕
           </button>
+        </div>
+      )}
+
+      {/* Latest Run Failure Alert (Preserving Last Completed Analysis) */}
+      {latestFailure && latestRun?.status === 'FAILED' && (
+        <div className="mb-4 flex items-center justify-between rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-300">
+          <span>
+            Most recent investigation run failed ({latestFailure.error || 'Provider error'}). Retaining last verified analysis below.
+          </span>
+        </div>
+      )}
+
+      {/* Validation Warning Alert */}
+      {activeRun?.validationError && (
+        <div className="mb-4 rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-3 text-xs text-yellow-300">
+          <span className="font-semibold">Grounding Notice: </span>
+          <span>{activeRun.validationError}</span>
         </div>
       )}
 
@@ -142,21 +170,21 @@ export const AIInvestigationSection: React.FC<AIInvestigationSectionProps> = ({
           <div className="h-4 w-4 animate-spin rounded-full border-2 border-purple-500 border-t-transparent" />
           <span>Synthesizing investigation findings...</span>
         </div>
-      ) : !latestRun ? (
+      ) : !activeRun ? (
         <div className="py-8 text-center text-sm text-gray-500">
           No AI investigation generated yet. Click &quot;Run AI Investigation&quot; to synthesize evidence.
         </div>
       ) : (
         <div className="space-y-6">
-          {/* Summary & Probable Root Cause */}
+          {/* Summary & Probable Root Cause Hypothesis */}
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <div className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
               <h3 className="mb-1 text-xs font-semibold uppercase tracking-wider text-purple-400">Incident Overview</h3>
-              <p className="text-xs text-gray-300 leading-relaxed">{latestRun.incidentSummary}</p>
+              <p className="text-xs text-gray-300 leading-relaxed">{activeRun.incidentSummary}</p>
             </div>
             <div className="rounded-xl border border-purple-500/20 bg-purple-500/5 p-4">
-              <h3 className="mb-1 text-xs font-semibold uppercase tracking-wider text-purple-300">Probable Root Cause</h3>
-              <p className="text-xs font-medium text-white leading-relaxed">{latestRun.probableRootCause}</p>
+              <h3 className="mb-1 text-xs font-semibold uppercase tracking-wider text-purple-300">AI-Generated Leading Hypothesis</h3>
+              <p className="text-xs font-medium text-white leading-relaxed">{activeRun.probableRootCause}</p>
             </div>
           </div>
 
@@ -166,11 +194,11 @@ export const AIInvestigationSection: React.FC<AIInvestigationSectionProps> = ({
             <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.02] p-4">
               <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
                 <span className="h-2 w-2 rounded-full bg-emerald-400" />
-                Supporting Evidence ({Array.isArray(latestRun.supportingEvidence) ? latestRun.supportingEvidence.length : 0})
+                Supporting Evidence ({Array.isArray(activeRun.supportingEvidence) ? activeRun.supportingEvidence.length : 0})
               </h3>
-              {Array.isArray(latestRun.supportingEvidence) && latestRun.supportingEvidence.length > 0 ? (
+              {Array.isArray(activeRun.supportingEvidence) && activeRun.supportingEvidence.length > 0 ? (
                 <div className="space-y-2">
-                  {latestRun.supportingEvidence.map((item, idx) => (
+                  {activeRun.supportingEvidence.map((item, idx) => (
                     <div key={idx} className="rounded-lg border border-emerald-500/10 bg-emerald-500/5 p-2.5 text-xs text-gray-300">
                       <p className="font-semibold text-emerald-300">{item.claim}</p>
                       <p className="mt-1 text-[11px] text-gray-400">{item.relevanceReason}</p>
@@ -186,11 +214,11 @@ export const AIInvestigationSection: React.FC<AIInvestigationSectionProps> = ({
             <div className="rounded-xl border border-amber-500/20 bg-amber-500/[0.02] p-4">
               <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
                 <span className="h-2 w-2 rounded-full bg-amber-400" />
-                Contradictory / Disproven Factors ({Array.isArray(latestRun.contradictoryEvidence) ? latestRun.contradictoryEvidence.length : 0})
+                Contradictory / Disproven Factors ({Array.isArray(activeRun.contradictoryEvidence) ? activeRun.contradictoryEvidence.length : 0})
               </h3>
-              {Array.isArray(latestRun.contradictoryEvidence) && latestRun.contradictoryEvidence.length > 0 ? (
+              {Array.isArray(activeRun.contradictoryEvidence) && activeRun.contradictoryEvidence.length > 0 ? (
                 <div className="space-y-2">
-                  {latestRun.contradictoryEvidence.map((item, idx) => (
+                  {activeRun.contradictoryEvidence.map((item, idx) => (
                     <div key={idx} className="rounded-lg border border-amber-500/10 bg-amber-500/5 p-2.5 text-xs text-gray-300">
                       <p className="font-semibold text-amber-300">{item.contradiction}</p>
                     </div>
@@ -202,12 +230,31 @@ export const AIInvestigationSection: React.FC<AIInvestigationSectionProps> = ({
             </div>
           </div>
 
+          {/* Alternative Hypotheses */}
+          {Array.isArray(activeRun.alternativeHypotheses) && activeRun.alternativeHypotheses.length > 0 && (
+            <div className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
+              <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-purple-400">Alternative Hypotheses</h3>
+              <div className="space-y-2">
+                {activeRun.alternativeHypotheses.map((h, idx) => (
+                  <div key={idx} className="rounded-lg border border-white/10 bg-white/[0.03] p-2.5 text-xs text-gray-300">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="font-semibold text-gray-200">{h.hypothesis}</p>
+                      <span className="rounded bg-white/10 px-2 py-0.5 text-[10px] font-bold text-gray-400 uppercase">
+                        {h.likelihood} LIKELIHOOD
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Recommended Actions */}
-          {Array.isArray(latestRun.recommendedActions) && latestRun.recommendedActions.length > 0 && (
+          {Array.isArray(activeRun.recommendedActions) && activeRun.recommendedActions.length > 0 && (
             <div className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
               <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-purple-400">Recommended Remediation Steps</h3>
               <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
-                {latestRun.recommendedActions.map((act, idx) => (
+                {activeRun.recommendedActions.map((act, idx) => (
                   <div key={idx} className="rounded-lg border border-white/10 bg-white/[0.04] p-3 text-xs">
                     <div className="flex items-center justify-between gap-2 mb-1">
                       <span className="rounded bg-purple-500/20 px-2 py-0.5 text-[10px] font-bold text-purple-300 uppercase">
@@ -226,15 +273,15 @@ export const AIInvestigationSection: React.FC<AIInvestigationSectionProps> = ({
           <div className="grid grid-cols-1 gap-4 md:grid-cols-3 text-xs">
             <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3">
               <span className="text-[10px] font-bold uppercase text-gray-400">Impact Assessment</span>
-              <p className="mt-1 text-gray-300">{latestRun.impactAssessment || 'N/A'}</p>
+              <p className="mt-1 text-gray-300">{activeRun.impactAssessment || 'N/A'}</p>
             </div>
             <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3">
               <span className="text-[10px] font-bold uppercase text-gray-400">Risk Assessment</span>
-              <p className="mt-1 text-gray-300">{latestRun.riskAssessment || 'N/A'}</p>
+              <p className="mt-1 text-gray-300">{activeRun.riskAssessment || 'N/A'}</p>
             </div>
             <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3">
               <span className="text-[10px] font-bold uppercase text-gray-400">Limitations &amp; Uncertainty</span>
-              <p className="mt-1 text-gray-400">{latestRun.investigationLimitations || 'None noted'}</p>
+              <p className="mt-1 text-gray-400">{activeRun.investigationLimitations || 'None noted'}</p>
             </div>
           </div>
         </div>

@@ -1,4 +1,32 @@
+import crypto from 'crypto';
+import type { Request, Response } from 'express';
 import rateLimit from 'express-rate-limit';
+
+const SAFE_REQUEST_ID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
+
+const createRateLimitHandler = (message: string) => (req: Request, res: Response): void => {
+  let requestId = res.getHeader('X-Request-ID');
+  if (typeof requestId !== 'string' || !SAFE_REQUEST_ID_REGEX.test(requestId)) {
+    const headerReqId = req.headers['x-request-id'];
+    if (typeof headerReqId === 'string' && SAFE_REQUEST_ID_REGEX.test(headerReqId)) {
+      requestId = headerReqId;
+    } else if (typeof req.id === 'string' && SAFE_REQUEST_ID_REGEX.test(req.id)) {
+      requestId = req.id;
+    } else {
+      requestId = crypto.randomUUID();
+    }
+    res.setHeader('X-Request-ID', requestId);
+  }
+
+  res.status(429).json({
+    success: false,
+    error: {
+      code: 'TOO_MANY_REQUESTS',
+      message,
+      requestId,
+    },
+  });
+};
 
 /**
  * Rate limiter middleware for authentication endpoints to prevent brute-force attacks.
@@ -9,13 +37,7 @@ export const authRateLimiter = rateLimit({
   limit: 10, // Limit each IP to 10 requests per window
   standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
   legacyHeaders: false, // Disable `X-RateLimit-*` headers
-  message: {
-    success: false,
-    error: {
-      code: 'TOO_MANY_REQUESTS',
-      message: 'Too many authentication attempts. Please try again in 15 minutes.',
-    },
-  },
+  handler: createRateLimitHandler('Too many authentication attempts. Please try again in 15 minutes.'),
 });
 
 /**
@@ -27,13 +49,7 @@ export const globalApiRateLimiter = rateLimit({
   limit: process.env['NODE_ENV'] === 'test' ? 10000 : 300,
   standardHeaders: true,
   legacyHeaders: false,
-  message: {
-    success: false,
-    error: {
-      code: 'TOO_MANY_REQUESTS',
-      message: 'Too many API requests. Please slow down.',
-    },
-  },
+  handler: createRateLimitHandler('Too many API requests. Please slow down.'),
 });
 
 /**
@@ -45,13 +61,7 @@ export const analyticsRateLimiter = rateLimit({
   limit: process.env['NODE_ENV'] === 'test' ? 10000 : 30,
   standardHeaders: true,
   legacyHeaders: false,
-  message: {
-    success: false,
-    error: {
-      code: 'TOO_MANY_REQUESTS',
-      message: 'Analytics query limit exceeded. Please wait a minute before retrying.',
-    },
-  },
+  handler: createRateLimitHandler('Analytics query limit exceeded. Please wait a minute before retrying.'),
 });
 
 /**
@@ -63,11 +73,5 @@ export const webhookRateLimiter = rateLimit({
   limit: process.env['NODE_ENV'] === 'test' ? 10000 : 1000,
   standardHeaders: true,
   legacyHeaders: false,
-  message: {
-    success: false,
-    error: {
-      code: 'TOO_MANY_REQUESTS',
-      message: 'Webhook burst rate limit exceeded.',
-    },
-  },
+  handler: createRateLimitHandler('Webhook burst rate limit exceeded.'),
 });

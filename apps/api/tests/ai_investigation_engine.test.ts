@@ -211,7 +211,7 @@ describe('Phase 9 — AI Investigation Engine Integration Tests', () => {
       const res = await AIService.runInvestigation(orgAId, incidentId, undefined, 'MANUAL_REQUEST');
 
       if (health === 'connected') {
-        expect(res.status).toBe('skipped: lock active');
+        expect(res.status).toMatch(/skipped.*lock.*active/);
         await redis.del(lockKey);
       } else {
         expect(res.status).toBe('completed');

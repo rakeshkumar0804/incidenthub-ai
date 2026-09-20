@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { authenticate, requireOrgMember } from '../../../middleware/auth';
 import { requirePermission } from '../../../middleware/rbac';
+import { requireOrgIncidentPermission } from '../../../middleware/resourceAuth';
 import { GitHubController } from './github.controller';
 
 const orgGithubRouter = Router({ mergeParams: true });
@@ -107,7 +108,9 @@ orgGithubRouter.get(
 // Incident Activity Linking
 orgGithubRouter.post(
   '/incidents/:incidentId/link',
-  requirePermission('incidents:comment'),
+  (req, res, next) => {
+    void requireOrgIncidentPermission('incidents:comment')(req, res, next);
+  },
   (req, res, next) => {
     void GitHubController.linkIncidentActivity(req, res, next);
   },

@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { JiraController } from './jira.controller';
 import { authenticate, requireOrgMember } from '../../../middleware/auth';
 import { requirePermission } from '../../../middleware/rbac';
+import { requireOrgIncidentPermission } from '../../../middleware/resourceAuth';
 
 const router = Router({ mergeParams: true });
 
@@ -19,9 +20,15 @@ router.post('/connect-token', requirePermission('integrations:manage'), (req, re
 router.delete('/disconnect', requirePermission('integrations:manage'), (req, res, next) => {
   void JiraController.disconnect(req, res, next);
 });
-router.post('/incidents/:incidentId/action-items/:actionItemId/jira-issue', requirePermission('incidents:update'), (req, res, next) => {
-  void JiraController.createJiraIssue(req, res, next);
-});
+router.post(
+  '/incidents/:incidentId/action-items/:actionItemId/jira-issue',
+  (req, res, next) => {
+    void requireOrgIncidentPermission('incidents:update')(req, res, next);
+  },
+  (req, res, next) => {
+    void JiraController.createJiraIssue(req, res, next);
+  },
+);
 
 export { router as jiraRouter };
 

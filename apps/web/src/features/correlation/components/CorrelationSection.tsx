@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { correlationService } from '../../../services/correlationService';
-import type { IncidentEvidenceDto, CorrelationRunDto } from '@incidenthub/shared';
+import { type IncidentEvidenceDto, type CorrelationRunDto, EvidenceConfidenceTier } from '@incidenthub/shared';
 
 interface Props {
   organizationId: string;
@@ -15,7 +15,7 @@ export function CorrelationSection({ organizationId, incidentId }: Props) {
   const [isLoading, setIsLoading] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [selectedTier, setSelectedTier] = useState<'ALL' | 'HIGH' | 'MEDIUM' | 'LOW'>('ALL');
+  const [selectedTier, setSelectedTier] = useState<'ALL' | EvidenceConfidenceTier>('ALL');
 
   // Monotonic fetch counter — prevents a stale/slow response from overwriting a newer result
   const fetchGenRef = useRef(0);
@@ -67,10 +67,12 @@ export function CorrelationSection({ organizationId, incidentId }: Props) {
 
   const handleAction = async (evidenceId: string, action: 'acknowledge' | 'dismiss' | 'reset') => {
     try {
+      setErrorMsg(null);
       const updated = await correlationService.updateEvidenceStatus(organizationId, incidentId, evidenceId, action);
       setEvidence((prev) => prev.map((item) => (item.id === evidenceId ? updated : item)));
-    } catch {
-      // Ignore action errors
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to update evidence status';
+      setErrorMsg(msg);
     }
   };
 
@@ -79,9 +81,9 @@ export function CorrelationSection({ organizationId, incidentId }: Props) {
     return item.confidenceTier === selectedTier;
   });
 
-  const highCount = evidence.filter((e) => e.confidenceTier === 'HIGH').length;
-  const mediumCount = evidence.filter((e) => e.confidenceTier === 'MEDIUM').length;
-  const lowCount = evidence.filter((e) => e.confidenceTier === 'LOW').length;
+  const highCount = evidence.filter((e) => e.confidenceTier === EvidenceConfidenceTier.HIGH).length;
+  const mediumCount = evidence.filter((e) => e.confidenceTier === EvidenceConfidenceTier.MEDIUM).length;
+  const lowCount = evidence.filter((e) => e.confidenceTier === EvidenceConfidenceTier.LOW).length;
 
   return (
     <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-6 shadow-xl backdrop-blur-sm">
@@ -140,21 +142,25 @@ export function CorrelationSection({ organizationId, incidentId }: Props) {
 
       {/* Tier Filter Tabs */}
       <div className="mb-6 flex items-center gap-2 border-b border-white/5 pb-3">
-        {(['ALL', 'HIGH', 'MEDIUM', 'LOW'] as const).map((tier) => {
-          const count = tier === 'ALL' ? evidence.length : tier === 'HIGH' ? highCount : tier === 'MEDIUM' ? mediumCount : lowCount;
-          const isActive = selectedTier === tier;
+        {([
+          { key: 'ALL' as const, label: 'All Evidence', count: evidence.length },
+          { key: EvidenceConfidenceTier.HIGH, label: 'HIGH Match', count: highCount },
+          { key: EvidenceConfidenceTier.MEDIUM, label: 'MEDIUM Match', count: mediumCount },
+          { key: EvidenceConfidenceTier.LOW, label: 'LOW Match', count: lowCount },
+        ]).map((tab) => {
+          const isActive = selectedTier === tab.key;
           return (
             <button
-              key={tier}
+              key={tab.key}
               type="button"
-              onClick={() => setSelectedTier(tier)}
+              onClick={() => setSelectedTier(tab.key)}
               className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
                 isActive
                   ? 'bg-blue-600/20 text-blue-400 border border-blue-500/30'
                   : 'text-gray-400 hover:bg-white/5 hover:text-white'
               }`}
             >
-              {tier === 'ALL' ? 'All Evidence' : `${tier} Confidence`} ({count})
+              {tab.label} ({tab.count})
             </button>
           );
         })}
@@ -175,6 +181,7 @@ export function CorrelationSection({ organizationId, incidentId }: Props) {
           {filteredEvidence.map((item) => {
             const isDismissed = Boolean(item.dismissedAt);
             const isAcknowledged = Boolean(item.acknowledgedAt);
+            const matchScore = Math.round((item.confidence || 0) * 100);
 
             return (
               <div
@@ -182,9 +189,9 @@ export function CorrelationSection({ organizationId, incidentId }: Props) {
                 className={`rounded-xl border p-4 transition ${
                   isDismissed
                     ? 'border-white/5 bg-gray-900/40 opacity-50'
-                    : item.confidenceTier === 'HIGH'
+                    : item.confidenceTier === EvidenceConfidenceTier.HIGH
                     ? 'border-emerald-500/30 bg-emerald-500/5'
-                    : item.confidenceTier === 'MEDIUM'
+                    : item.confidenceTier === EvidenceConfidenceTier.MEDIUM
                     ? 'border-amber-500/30 bg-amber-500/5'
                     : 'border-white/10 bg-white/[0.02]'
                 }`}
@@ -194,14 +201,14 @@ export function CorrelationSection({ organizationId, incidentId }: Props) {
                     <div className="flex items-center gap-2">
                       <span
                         className={`rounded-md px-2 py-0.5 text-[10px] font-bold uppercase ${
-                          item.confidenceTier === 'HIGH'
+                          item.confidenceTier === EvidenceConfidenceTier.HIGH
                             ? 'bg-emerald-500/20 text-emerald-400'
-                            : item.confidenceTier === 'MEDIUM'
+                            : item.confidenceTier === EvidenceConfidenceTier.MEDIUM
                             ? 'bg-amber-500/20 text-amber-400'
                             : 'bg-gray-500/20 text-gray-400'
                         }`}
                       >
-                        {item.confidenceTier || 'LOW'} CONFIDENCE ({((item.confidence || 0) * 100).toFixed(0)}%)
+                        {item.confidenceTier || 'LOW'} MATCH · {matchScore}/100
                       </span>
 
                       {item.url ? (
@@ -263,37 +270,47 @@ export function CorrelationSection({ organizationId, incidentId }: Props) {
                   </div>
                 </div>
 
-                {/* Reason Pills */}
+                {/* Contextual Reason Pills */}
                 {item.reasons && (
                   <div className="mt-3 flex flex-wrap gap-1.5">
-                    {item.reasons.deploymentRelation && (
+                    {item.reasons.precursor && (
+                      <span className="rounded-md bg-blue-500/10 px-2 py-0.5 text-[10px] font-medium text-blue-300 border border-blue-500/20">
+                        Pre-incident
+                      </span>
+                    )}
+                    {item.reasons.postIncident && (
                       <span className="rounded-md bg-purple-500/10 px-2 py-0.5 text-[10px] font-medium text-purple-300 border border-purple-500/20">
-                        Preceding Deployment
+                        Post-incident
                       </span>
                     )}
                     {item.reasons.commitRelation && (
-                      <span className="rounded-md bg-blue-500/10 px-2 py-0.5 text-[10px] font-medium text-blue-300 border border-blue-500/20">
-                        Included Commit
-                      </span>
-                    )}
-                    {item.reasons.sentrySpike && (
-                      <span className="rounded-md bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-300 border border-red-500/20">
-                        Sentry Error Spike
-                      </span>
-                    )}
-                    {item.reasons.workflowFailure && (
-                      <span className="rounded-md bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-300 border border-amber-500/20">
-                        Workflow Failure
+                      <span className="rounded-md bg-indigo-500/10 px-2 py-0.5 text-[10px] font-medium text-indigo-300 border border-indigo-500/20">
+                        Exact deployment SHA
                       </span>
                     )}
                     {item.reasons.serviceMatch && (
                       <span className="rounded-md bg-teal-500/10 px-2 py-0.5 text-[10px] font-medium text-teal-300 border border-teal-500/20">
-                        Service Match
+                        Same service
                       </span>
                     )}
-                    {item.reasons.temporalProximity && (
+                    {item.reasons.environmentMatch && (
+                      <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-300 border border-emerald-500/20">
+                        Environment match
+                      </span>
+                    )}
+                    {item.reasons.sentrySpike && (
+                      <span className="rounded-md bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-300 border border-red-500/20">
+                        Sentry spike
+                      </span>
+                    )}
+                    {item.reasons.workflowFailure && (
+                      <span className="rounded-md bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-300 border border-amber-500/20">
+                        Workflow failure
+                      </span>
+                    )}
+                    {item.reasons.temporalProximity && !item.reasons.precursor && !item.reasons.postIncident && (
                       <span className="rounded-md bg-gray-500/10 px-2 py-0.5 text-[10px] font-medium text-gray-400 border border-gray-500/20">
-                        Temporal Proximity
+                        Temporal proximity
                       </span>
                     )}
                   </div>

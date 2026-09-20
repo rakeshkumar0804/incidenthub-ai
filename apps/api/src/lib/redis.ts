@@ -187,11 +187,15 @@ export function ensureLocalRedisServer(): Promise<void> {
             } else if (cmd === 'EVAL' || cmd === 'EVALSHA') {
               // EVAL script numkeys KEYS[1] ARGV[1]
               // tokens: [0]=EVAL [1]=script [2]=numkeys [3]=KEYS[1] [4]=ARGV[1]
+              const script = tokens[1] || '';
               const evalKey = tokens[3];
               const evalVal = tokens[4];
-              if (evalKey && evalVal && !isExpired(evalKey) && store.get(evalKey) === evalVal) {
-                store.delete(evalKey);
-                expiry.delete(evalKey);
+              const matches = evalKey && evalVal && !isExpired(evalKey) && store.get(evalKey) === evalVal;
+              if (matches) {
+                if (/del/i.test(script)) {
+                  store.delete(evalKey);
+                  expiry.delete(evalKey);
+                }
                 socket.write(':1\r\n');
               } else {
                 socket.write(':0\r\n');
@@ -300,5 +304,161 @@ export async function safeRedisDel(keyPattern: string): Promise<void> {
     await Promise.race([delTask(), timeoutPromise]);
   } catch {
     // Silent degradation
+  }
+}
+
+import { ServiceUnavailableError } from '../utils/errors';
+
+/**
+ * Production Redis Policy: Redis is strictly required in production or when explicitly configured.
+ */
+export function isRedisRequired(): boolean {
+  return process.env['NODE_ENV'] === 'production' || process.env['REDIS_REQUIRED'] === 'true';
+}
+
+export interface DistributedLockResult {
+  acquired: boolean;
+  isRedisLock: boolean;
+}
+
+/**
+ * Performs atomic Redis distributed lock acquisition (SET key token PX ttl NX).
+ * In production, fails closed with 503 ServiceUnavailableError if Redis is unavailable,
+ * disconnected, throws, times out, or returns any non-success response.
+ * In development/test, falls back gracefully to process-local locking.
+ */
+export async function acquireDistributedLock(
+  lockKey: string,
+  lockVal: string,
+  lockTtlMs: number,
+  operationName: string,
+  acquisitionTimeoutMs = 3000,
+): Promise<DistributedLockResult> {
+  const prod = isRedisRequired();
+
+  if (prod) {
+    // 1. Production Mode: Strict distributed lock via Redis
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      if (redis.status !== 'ready' && redis.status !== 'connecting') {
+        throw new Error(`Redis client status is '${redis.status}' (expected ready)`);
+      }
+
+      const rawSetPromise = redis.set(lockKey, lockVal, 'PX', lockTtlMs, 'NX');
+      // Prevent unhandled promise rejection if Redis set rejects after race timeout
+      rawSetPromise.catch(() => {});
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Redis lock acquisition timed out after ${acquisitionTimeoutMs}ms`)), acquisitionTimeoutMs);
+      });
+
+      const res = await Promise.race([rawSetPromise, timeoutPromise]);
+
+      if (res === 'OK') {
+        return { acquired: true, isRedisLock: true };
+      }
+
+      if (res === null) {
+        // Lock is actively held by another concurrent worker
+        return { acquired: false, isRedisLock: true };
+      }
+
+      throw new Error(`Unexpected Redis SET NX response: ${String(res)}`);
+    } catch (err) {
+      logger.error({ err: (err as Error).message, operation: operationName, lockKey }, 'Production Redis lock acquisition failed closed');
+      throw new ServiceUnavailableError(`Distributed operation '${operationName}' unavailable: Redis lock acquisition failed (${(err as Error).message})`);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  } else {
+    // 2. Dev / Test Mode: Attempt Redis, fallback to local
+    try {
+      if (redis.status === 'ready' || redis.status === 'connecting') {
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          const rawSetPromise = redis.set(lockKey, lockVal, 'PX', lockTtlMs, 'NX');
+          const setPromise = rawSetPromise.catch(() => null);
+          const timeoutPromise = new Promise<null>((resolve) => {
+            timer = setTimeout(() => resolve(null), 1000);
+          });
+          const res = await Promise.race([setPromise, timeoutPromise]);
+          if (res === 'OK') {
+            return { acquired: true, isRedisLock: true };
+          }
+          if (res === null && redis.status === 'ready') {
+            return { acquired: false, isRedisLock: true };
+          }
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      }
+    } catch {
+      // Fallback to local
+    }
+
+    return { acquired: true, isRedisLock: false };
+  }
+}
+
+/**
+ * Evaluates atomic compare-and-renew Lua script to verify lock ownership.
+ */
+export async function verifyLockOwnership(
+  lockKey: string,
+  lockVal: string,
+  lockTtlMs: number,
+): Promise<boolean> {
+  try {
+    if (redis.status !== 'ready') {
+      return false;
+    }
+    const renewLua = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("pexpire", KEYS[1], ARGV[2])
+      else
+        return 0
+      end
+    `;
+    const result = await redis.eval(renewLua, 1, lockKey, lockVal, lockTtlMs);
+    return result === 1;
+  } catch (err) {
+    logger.warn({ err: (err as Error).message, lockKey }, 'Redis lock ownership verification failed');
+    return false;
+  }
+}
+
+/**
+ * Releases a distributed Redis lock safely using atomic compare-and-del Lua script.
+ */
+export async function releaseDistributedLock(
+  lockKey: string,
+  lockVal: string,
+): Promise<void> {
+  try {
+    if (redis.status === 'ready') {
+      const releaseLua = `
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+          return redis.call("del", KEYS[1])
+        else
+          return 0
+        end
+      `;
+      await redis.eval(releaseLua, 1, lockKey, lockVal);
+    }
+  } catch {
+    // Ignore safe release errors
+  }
+}
+
+/**
+ * Safe Redis connection closure for graceful shutdown.
+ */
+export async function closeRedis(): Promise<void> {
+  try {
+    if (redis.status === 'ready' || redis.status === 'connecting') {
+      await redis.quit();
+    }
+  } catch {
+    // Ignore error on close
   }
 }

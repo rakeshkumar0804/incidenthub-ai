@@ -1,4 +1,5 @@
 import type { PostmortemProviderResult } from '../postmortem.types';
+import type { PostmortemSourceSnapshot } from '../postmortem.engine';
 
 export interface PostmortemInputContext {
   incident: {
@@ -9,8 +10,8 @@ export interface PostmortemInputContext {
     severity: string;
     status: string;
     environment: string;
-    detectedAt: Date;
-    resolvedAt: Date | null;
+    detectedAt: string | Date;
+    resolvedAt: string | Date | null;
     serviceName: string | null;
     projectName: string | null;
   };
@@ -27,7 +28,7 @@ export interface PostmortemInputContext {
     probableRootCause: string | null;
     confidenceTier: string | null;
     riskAssessment: string | null;
-    uncertainty: string | null;
+    uncertainty: string | string[] | null;
   } | null;
   replayEvents: Array<{
     id: string;
@@ -35,11 +36,14 @@ export interface PostmortemInputContext {
     category: string;
     eventType: string;
     title: string;
-    timestamp: Date;
+    timestamp: string | Date;
     actorName: string | null;
   }>;
 }
 
 export interface AIPostmortemProvider {
-  generatePostmortem(context: PostmortemInputContext): Promise<PostmortemProviderResult>;
+  generatePostmortem(
+    context: PostmortemInputContext,
+    snapshot?: PostmortemSourceSnapshot,
+  ): Promise<PostmortemProviderResult>;
 }

@@ -86,7 +86,7 @@ export function AcceptInvitationPage() {
                 </Link>
               ) : (
                 <button
-                  onClick={() => navigate('/')}
+                  onClick={() => { void navigate('/'); }}
                   className="mt-6 w-full rounded-xl bg-blue-600 py-3 text-sm font-semibold text-white shadow-lg shadow-blue-500/25 transition hover:bg-blue-500"
                 >
                   Go to workspace

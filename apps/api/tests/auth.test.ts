@@ -189,21 +189,19 @@ describe('Auth Endpoints (/api/v1/auth)', () => {
     expect(refreshRes.status).toBe(401);
   });
 
-  it('12. POST /dev-restore-owner — restores owner membership in development environment', async () => {
-    const res = await request.post('/api/v1/auth/dev-restore-owner').send({});
-    expect(res.status).toBe(200);
-    const body = res.body as ApiSuccess<{ user: { email: string }; organizations: Array<{ role: string }> }>;
-    expect(body.success).toBe(true);
-    expect(body.data.user.email).toBe('rakesh6651@company.com');
-    expect(body.data.organizations[0]?.role).toBe('OWNER');
+  it('12. POST /dev-restore-owner and /dev-reset-viewer — removed endpoints return 404', async () => {
+    const res1 = await request.post('/api/v1/auth/dev-restore-owner').send({});
+    expect(res1.status).toBe(404);
+
+    const res2 = await request.post('/api/v1/auth/dev-reset-viewer').send({});
+    expect(res2.status).toBe(404);
   });
 
-  it('13. POST /dev-reset-viewer — resets viewer password in development environment', async () => {
-    const res = await request.post('/api/v1/auth/dev-reset-viewer').send({});
-    expect(res.status).toBe(200);
-    const body = res.body as ApiSuccess<{ user: { email: string }; organizations: Array<{ role: string }> }>;
-    expect(body.success).toBe(true);
-    expect(body.data.user.email).toBe('rakesh5566@company.com');
-    expect(body.data.organizations[0]?.role).toBe('VIEWER');
+  it('13. POST /seed-demo and /clean-demo-orgs — removed endpoints return 404', async () => {
+    const res1 = await request.post('/api/v1/auth/seed-demo').send({});
+    expect(res1.status).toBe(404);
+
+    const res2 = await request.post('/api/v1/auth/clean-demo-orgs').send({});
+    expect(res2.status).toBe(404);
   });
 });

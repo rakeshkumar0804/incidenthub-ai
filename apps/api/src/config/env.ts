@@ -19,6 +19,11 @@ const envSchema = z.object({
   JWT_REFRESH_SECRET: z.string().min(16).default('incidenthub-jwt-refresh-secret-key-development-minimum-32-chars-long'),
   JWT_EXPIRES_IN: z.string().default('15m'),
   JWT_REFRESH_EXPIRES_IN: z.string().default('7d'),
+  GITHUB_WEBHOOK_SECRET: z.string().optional(),
+  SENTRY_WEBHOOK_SECRET: z.string().optional(),
+  SLACK_SIGNING_SECRET: z.string().optional(),
+  JIRA_WEBHOOK_SECRET: z.string().optional(),
+  CORS_ALLOWED_ORIGINS: z.string().optional(),
 });
 
 const parseResult = envSchema.safeParse(process.env);
@@ -33,10 +38,45 @@ if (!parseResult.success) {
   process.exit(1);
 }
 
+export function validateProductionConfig(data: Partial<z.infer<typeof envSchema>>): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  if (data.NODE_ENV === 'production') {
+    const jwt = data.JWT_SECRET || '';
+    if (jwt.length < 32) {
+      errors.push('JWT_SECRET must be at least 32 characters long in production');
+    }
+    if (jwt.toLowerCase().includes('development') || jwt.toLowerCase().includes('change_me')) {
+      errors.push('Insecure development placeholder found in JWT_SECRET');
+    }
+
+    const refreshJwt = data.JWT_REFRESH_SECRET || '';
+    if (refreshJwt.length < 32) {
+      errors.push('JWT_REFRESH_SECRET must be at least 32 characters long in production');
+    }
+    if (refreshJwt.toLowerCase().includes('development') || refreshJwt.toLowerCase().includes('change_me')) {
+      errors.push('Insecure development placeholder found in JWT_REFRESH_SECRET');
+    }
+
+    const dbUrl = data.DATABASE_URL || '';
+    if (dbUrl.includes('change_me')) {
+      errors.push('Insecure default password found in DATABASE_URL');
+    }
+  }
+  return {
+    valid: errors.length === 0,
+    errors,
+  };
+}
+
 if (parseResult.data.NODE_ENV === 'production') {
-  if (parseResult.data.JWT_SECRET.includes('development')) {
+  const prodCheck = validateProductionConfig(parseResult.data);
+  if (!prodCheck.valid) {
     // eslint-disable-next-line no-console
-    console.error('\n❌ Insecure JWT_SECRET in production mode');
+    console.error('\n❌ Production environment configuration invalid:');
+    prodCheck.errors.forEach((err) => {
+      // eslint-disable-next-line no-console
+      console.error(`  - ${err}`);
+    });
     process.exit(1);
   }
 }

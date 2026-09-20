@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { TeamController } from './team.controller';
 import { authenticate, requireAuth, requireOrgMember } from '../../middleware/auth';
 import { requirePermission } from '../../middleware/rbac';
+import { requireTeamPermission } from '../../middleware/resourceAuth';
 
 const orgTeamsRouter = Router({ mergeParams: true });
 const rootTeamsRouter = Router();
@@ -39,12 +40,16 @@ orgTeamsRouter.post(
 );
 
 // GET /api/v1/teams/:teamId
+
 rootTeamsRouter.get(
   '/:teamId',
   (req, res, next) => {
     void authenticate(req, res, next);
   },
   requireAuth,
+  (req, res, next) => {
+    void requireTeamPermission('teams:read')(req, res, next);
+  },
   (req, res, next) => {
     void TeamController.getById(req, res, next);
   },
@@ -58,6 +63,9 @@ rootTeamsRouter.patch(
   },
   requireAuth,
   (req, res, next) => {
+    void requireTeamPermission('teams:manage')(req, res, next);
+  },
+  (req, res, next) => {
     void TeamController.update(req, res, next);
   },
 );
@@ -69,6 +77,9 @@ rootTeamsRouter.delete(
     void authenticate(req, res, next);
   },
   requireAuth,
+  (req, res, next) => {
+    void requireTeamPermission('teams:manage')(req, res, next);
+  },
   (req, res, next) => {
     void TeamController.delete(req, res, next);
   },
@@ -82,6 +93,9 @@ rootTeamsRouter.post(
   },
   requireAuth,
   (req, res, next) => {
+    void requireTeamPermission('teams:manage')(req, res, next);
+  },
+  (req, res, next) => {
     void TeamController.addMember(req, res, next);
   },
 );
@@ -93,6 +107,9 @@ rootTeamsRouter.delete(
     void authenticate(req, res, next);
   },
   requireAuth,
+  (req, res, next) => {
+    void requireTeamPermission('teams:manage')(req, res, next);
+  },
   (req, res, next) => {
     void TeamController.removeMember(req, res, next);
   },

@@ -303,10 +303,13 @@ describe('Phase 7 — Sentry Integration Tests', () => {
     };
 
     it('processes valid Sentry webhook payload and normalizes signal', async () => {
+      const secret = process.env['SENTRY_WEBHOOK_SECRET'] || 'test-sentry-webhook-secret-32chars-min!';
+      const sig = crypto.createHmac('sha256', secret).update(JSON.stringify(validPayload)).digest('hex');
+
       const res = await request
         .post('/api/v1/webhooks/sentry')
         .set('sentry-hook-resource', deliveryId)
-        .set('sentry-hook-signature', 'valid-signature')
+        .set('sentry-hook-signature', sig)
         .send(validPayload);
 
       const body = res.body as TestRes<{ status: string; issueId: string }>;
@@ -325,22 +328,30 @@ describe('Phase 7 — Sentry Integration Tests', () => {
     });
 
     it('enforces idempotency — duplicate webhook delivery is safely ignored', async () => {
+      const secret = process.env['SENTRY_WEBHOOK_SECRET'] || 'test-sentry-webhook-secret-32chars-min!';
+      const sig = crypto.createHmac('sha256', secret).update(JSON.stringify(validPayload)).digest('hex');
+
       const res = await request
         .post('/api/v1/webhooks/sentry')
         .set('sentry-hook-resource', deliveryId)
-        .set('sentry-hook-signature', 'valid-signature')
+        .set('sentry-hook-signature', sig)
         .send(validPayload);
 
       const body = res.body as TestRes<{ status: string }>;
       expect(res.status).toBe(200);
-      expect(body.data.status).toBe('ignored: duplicate delivery');
+      expect(body.data.status).toBe('duplicate');
     });
 
     it('returns 200 for malformed payload (does not crash, returns processed status)', async () => {
+      const malformedPayload = { broken: 'payload' };
+      const secret = process.env['SENTRY_WEBHOOK_SECRET'] || 'test-sentry-webhook-secret-32chars-min!';
+      const sig = crypto.createHmac('sha256', secret).update(JSON.stringify(malformedPayload)).digest('hex');
+
       const res = await request
         .post('/api/v1/webhooks/sentry')
         .set('sentry-hook-resource', `malformed-deliv-${Date.now()}`)
-        .send({ broken: 'payload' });
+        .set('sentry-hook-signature', sig)
+        .send(malformedPayload);
 
       expect(res.status).toBe(200);
     });
@@ -416,24 +427,32 @@ describe('Phase 7 — Sentry Integration Tests', () => {
     it('does NOT auto-create incident when autoCreateIncident=false (even if thresholds met)', async () => {
       // Rule has autoCreateIncident=false — webhook should NOT create an incident
       const incidentCountBefore = await prisma.incident.count({ where: { organizationId: orgId } });
+      const secret = process.env['SENTRY_WEBHOOK_SECRET'] || 'test-sentry-webhook-secret-phase1-audit';
+
+      const payload = {
+        action: 'error',
+        project_slug: 'core-api',
+        organization_slug: 'acme-corp',
+        issue: {
+          id: `fatal-no-auto-${Date.now()}`,
+          title: 'FatalError: DB connection pool exhausted',
+          level: 'fatal',
+          count: '5000',
+          userCount: 9999,
+          firstSeen: new Date().toISOString(),
+          lastSeen: new Date().toISOString(),
+        },
+        event: { environment: 'production', release: '2.0.0' },
+      };
+      const rawPayload = JSON.stringify(payload);
+      const signature = crypto.createHmac('sha256', secret).update(rawPayload).digest('hex');
 
       await request
         .post('/api/v1/webhooks/sentry')
+        .set('Content-Type', 'application/json')
         .set('sentry-hook-resource', `fatal-delivery-no-auto-${Date.now()}`)
-        .send({
-          action: 'error',
-          project_slug: 'core-api',
-          issue: {
-            id: `fatal-no-auto-${Date.now()}`,
-            title: 'FatalError: DB connection pool exhausted',
-            level: 'fatal',
-            count: '5000',
-            userCount: 9999,
-            firstSeen: new Date().toISOString(),
-            lastSeen: new Date().toISOString(),
-          },
-          event: { environment: 'production', release: '2.0.0' },
-        });
+        .set('sentry-hook-signature', signature)
+        .send(payload);
 
       const incidentCountAfter = await prisma.incident.count({ where: { organizationId: orgId } });
       // Count should NOT increase since autoCreateIncident=false
@@ -457,24 +476,32 @@ describe('Phase 7 — Sentry Integration Tests', () => {
         });
 
       const incidentCountBefore = await prisma.incident.count({ where: { organizationId: orgId } });
+      const secret = process.env['SENTRY_WEBHOOK_SECRET'] || 'test-sentry-webhook-secret-phase1-audit';
+
+      const payload = {
+        action: 'error',
+        project_slug: 'core-api',
+        organization_slug: 'acme-corp',
+        issue: {
+          id: `fatal-auto-${Date.now()}`,
+          title: 'FatalError: Memory limit exceeded',
+          level: 'fatal',
+          count: '1000',
+          userCount: 500,
+          firstSeen: new Date().toISOString(),
+          lastSeen: new Date().toISOString(),
+        },
+        event: { environment: 'production', release: '3.0.0' },
+      };
+      const rawPayload = JSON.stringify(payload);
+      const signature = crypto.createHmac('sha256', secret).update(rawPayload).digest('hex');
 
       await request
         .post('/api/v1/webhooks/sentry')
+        .set('Content-Type', 'application/json')
         .set('sentry-hook-resource', `fatal-auto-create-${Date.now()}`)
-        .send({
-          action: 'error',
-          project_slug: 'core-api',
-          issue: {
-            id: `fatal-auto-${Date.now()}`,
-            title: 'FatalError: Memory limit exceeded',
-            level: 'fatal',
-            count: '1000',
-            userCount: 500,
-            firstSeen: new Date().toISOString(),
-            lastSeen: new Date().toISOString(),
-          },
-          event: { environment: 'production', release: '3.0.0' },
-        });
+        .set('sentry-hook-signature', signature)
+        .send(payload);
 
       const incidentCountAfter = await prisma.incident.count({ where: { organizationId: orgId } });
       expect(incidentCountAfter).toBeGreaterThan(incidentCountBefore);
@@ -601,17 +628,17 @@ describe('Phase 7 — Sentry Integration Tests', () => {
   // 9. Sentry Webhook Signature Verification (Production Guard)
   // ============================================================
   describe('9. HMAC Signature Verification', () => {
-    it('accepts webhook when NODE_ENV is not production (dev mode)', async () => {
-      // In test mode signature is not enforced (NODE_ENV=test)
+    const webhookSecret = process.env['SENTRY_WEBHOOK_SECRET'] || 'test-sentry-webhook-secret-phase1-audit';
+
+    it('rejects webhook with missing signature (403)', async () => {
       const res = await request
         .post('/api/v1/webhooks/sentry')
-        .set('sentry-hook-resource', `sig-test-${Date.now()}`)
-        // No valid signature header
+        .set('sentry-hook-resource', `no-sig-${Date.now()}`)
         .send({
           action: 'error',
           issue: {
             id: `sig-test-issue-${Date.now()}`,
-            title: 'TestError in test env',
+            title: 'TestError missing sig',
             level: 'warning',
             count: '1',
             userCount: 1,
@@ -619,6 +646,53 @@ describe('Phase 7 — Sentry Integration Tests', () => {
             lastSeen: new Date().toISOString(),
           },
         });
+
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects webhook with invalid HMAC signature (403)', async () => {
+      const res = await request
+        .post('/api/v1/webhooks/sentry')
+        .set('sentry-hook-resource', `bad-sig-${Date.now()}`)
+        .set('sentry-hook-signature', 'sha256=invalid_sentry_signature_hex')
+        .send({
+          action: 'error',
+          issue: {
+            id: `sig-test-issue-${Date.now()}`,
+            title: 'TestError bad sig',
+            level: 'warning',
+            count: '1',
+            userCount: 1,
+            firstSeen: new Date().toISOString(),
+            lastSeen: new Date().toISOString(),
+          },
+        });
+
+      expect(res.status).toBe(403);
+    });
+
+    it('accepts webhook with valid HMAC signature (200)', async () => {
+      const payload = {
+        action: 'error',
+        issue: {
+          id: `sig-test-issue-${Date.now()}`,
+          title: 'TestError valid sig',
+          level: 'warning',
+          count: '1',
+          userCount: 1,
+          firstSeen: new Date().toISOString(),
+          lastSeen: new Date().toISOString(),
+        },
+      };
+      const rawPayload = JSON.stringify(payload);
+      const signature = crypto.createHmac('sha256', webhookSecret).update(rawPayload).digest('hex');
+
+      const res = await request
+        .post('/api/v1/webhooks/sentry')
+        .set('Content-Type', 'application/json')
+        .set('sentry-hook-resource', `sig-test-${Date.now()}`)
+        .set('sentry-hook-signature', signature)
+        .send(payload);
 
       expect(res.status).toBe(200);
     });
@@ -647,26 +721,34 @@ describe('Phase 7 — Sentry Integration Tests', () => {
   describe('10. Release & Environment Tracking', () => {
     it('stores release and environment from webhook payload', async () => {
       const uniqueId = `release-env-test-${Date.now()}`;
+      const secret = process.env['SENTRY_WEBHOOK_SECRET'] || 'test-sentry-webhook-secret-phase1-audit';
+      const payload = {
+        action: 'error',
+        project_slug: 'core-api',
+        organization_slug: 'acme-corp',
+        issue: {
+          id: uniqueId,
+          title: 'ReleaseError: Build artifact corrupt',
+          level: 'error',
+          count: '2',
+          userCount: 1,
+          firstSeen: new Date().toISOString(),
+          lastSeen: new Date().toISOString(),
+        },
+        event: {
+          release: 'v5.7.2-rc.1',
+          environment: 'staging',
+        },
+      };
+      const rawPayload = JSON.stringify(payload);
+      const signature = crypto.createHmac('sha256', secret).update(rawPayload).digest('hex');
+
       await request
         .post('/api/v1/webhooks/sentry')
+        .set('Content-Type', 'application/json')
         .set('sentry-hook-resource', `release-env-${Date.now()}`)
-        .send({
-          action: 'error',
-          project_slug: 'core-api',
-          issue: {
-            id: uniqueId,
-            title: 'ReleaseError: Build artifact corrupt',
-            level: 'error',
-            count: '2',
-            userCount: 1,
-            firstSeen: new Date().toISOString(),
-            lastSeen: new Date().toISOString(),
-          },
-          event: {
-            release: 'v5.7.2-rc.1',
-            environment: 'staging',
-          },
-        });
+        .set('sentry-hook-signature', signature)
+        .send(payload);
 
       const issue = await prisma.sentryIssue.findFirst({
         where: { organizationId: orgId, sentryIssueId: uniqueId },

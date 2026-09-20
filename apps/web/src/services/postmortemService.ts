@@ -7,11 +7,17 @@ import type {
   UpdatePostmortemInput,
   CreateActionItemInput,
   UpdateActionItemInput,
+  PostmortemRunDto,
+  LatestPostmortemFailureDto,
 } from '@incidenthub/shared';
 
 export interface PostmortemResponseData {
   incidentId: string;
   postmortem: PostmortemDto | null;
+  latestRun?: PostmortemRunDto | null;
+  latestCompletedRun?: PostmortemRunDto | null;
+  latestFailure?: LatestPostmortemFailureDto | null;
+  isRunning?: boolean;
 }
 
 export const postmortemService = {
@@ -25,24 +31,14 @@ export const postmortemService = {
     return res.data.data;
   },
 
-  generateDraftPostmortem: async (
-    organizationId: string,
-    incidentId: string,
-  ): Promise<{ runId: string; status: string }> => {
-    const res = await apiClient.post<ApiSuccess<{ runId: string; status: string }>>(
-      `/organizations/${organizationId}/incidents/${incidentId}/postmortem/generate`,
-    );
-    return res.data.data;
-  },
-
   generatePostmortem: async (
     organizationId: string,
     incidentId: string,
-    _triggerType?: string,
-  ): Promise<{ runId: string; status: string }> => {
-    const res = await apiClient.post<ApiSuccess<{ runId: string; status: string }>>(
-      `/organizations/${organizationId}/incidents/${incidentId}/postmortem/generate`,
-    );
+    triggerType: string = 'MANUAL_REQUEST',
+  ): Promise<{ postmortemId: string; versionId: string; versionNumber: number; status?: string; runId?: string }> => {
+    const res = await apiClient.post<
+      ApiSuccess<{ postmortemId: string; versionId: string; versionNumber: number; status?: string; runId?: string }>
+    >(`/organizations/${organizationId}/incidents/${incidentId}/postmortem`, { triggerType });
     return res.data.data;
   },
 

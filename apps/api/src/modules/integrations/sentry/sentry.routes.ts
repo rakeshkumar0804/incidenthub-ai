@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { authenticate, requireOrgMember } from '../../../middleware/auth';
 import { requirePermission } from '../../../middleware/rbac';
+import { requireOrgIncidentPermission } from '../../../middleware/resourceAuth';
 import { SentryController } from './sentry.controller';
 
 const orgRouter = Router({ mergeParams: true });
@@ -73,7 +74,7 @@ orgRouter.delete(
 // Link Issue to Incident (incidents:update — available to OWNER/ADMIN/RESPONDER)
 orgRouter.post(
   '/incidents/:incidentId/link',
-  requirePermission('incidents:update'),
+  (req, res, next) => { void requireOrgIncidentPermission('incidents:update')(req, res, next); },
   (req, res, next) => { void SentryController.linkIssueToIncident(req, res, next); },
 );
 

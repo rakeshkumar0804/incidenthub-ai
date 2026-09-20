@@ -36,7 +36,7 @@ export function RegisterPage() {
 
       if (data.success) {
         login(data.data);
-        navigate('/', { replace: true });
+        void navigate('/', { replace: true });
       }
     } catch (err: unknown) {
       if (typeof err === 'object' && err !== null && 'response' in err) {

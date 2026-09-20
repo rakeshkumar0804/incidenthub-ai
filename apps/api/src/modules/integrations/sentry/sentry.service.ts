@@ -4,7 +4,8 @@ import { prisma } from '../../../lib/prisma';
 import { encryptText } from '../../../utils/crypto';
 import { broadcastToIncident } from '../../../lib/socket';
 import { logger } from '../../../utils/logger';
-import { NotFoundError, ValidationError, ForbiddenError } from '../../../utils/errors';
+import { NotFoundError, ValidationError, ForbiddenError, classifyPrismaUniqueError } from '../../../utils/errors';
+import { invalidateAnalyticsCache } from '../../analytics/analytics.service';
 import {
   IntegrationProvider,
   IntegrationStatus,
@@ -78,17 +79,23 @@ interface SentryWebhookEvent {
   environment?: string;
 }
 
-interface SentryWebhookPayload {
+export interface SentryWebhookPayload {
   action?: string;
   project_slug?: string;
   project?: string;
   organization_slug?: string;
+  organization?: {
+    slug?: string;
+  };
   message?: string;
   issue?: SentryWebhookIssue;
   event?: SentryWebhookEvent;
   data?: {
     issue?: SentryWebhookIssue;
     event?: SentryWebhookEvent;
+    project?: {
+      slug?: string;
+    };
     organization?: {
       slug?: string;
     };
@@ -401,99 +408,37 @@ export class SentryService {
   /**
    * Verifies official Sentry Service-Hook / Webhook HMAC signature.
    */
-  public static verifySentrySignature(rawPayload: string, signatureHeader: string | undefined, secret: string): boolean {
+  public static verifySentrySignature(rawPayload: string | Buffer, signatureHeader: string | undefined, secret: string): boolean {
     if (!signatureHeader || !secret) return false;
 
     try {
       const hmac = crypto.createHmac('sha256', secret);
-      hmac.update(rawPayload, 'utf8');
+      hmac.update(rawPayload);
       const expectedSignature = hmac.digest('hex');
 
       const cleanSignature = signatureHeader.replace(/^sha256=/, '').trim();
-      return crypto.timingSafeEqual(Buffer.from(cleanSignature), Buffer.from(expectedSignature));
+      const sigBuf = Buffer.from(cleanSignature);
+      const expBuf = Buffer.from(expectedSignature);
+      if (sigBuf.length !== expBuf.length) {
+        return false;
+      }
+      return crypto.timingSafeEqual(sigBuf, expBuf);
     } catch {
       return false;
     }
   }
 
   /**
-   * Deterministically resolves organization and integration for incoming Sentry webhook.
-   * Eliminates unscoped findFirst() queries and preserves strict tenant isolation.
+   * Resolves target Organization and Integration for incoming Sentry Webhook.
+   * Strictly verifies tenant matching and fails closed on zero or ambiguous (>1) matches.
    */
-  private static async resolveWebhookTenant(
+  public static async resolveWebhookTenant(
     payload: SentryWebhookPayload,
   ): Promise<{ organizationId: string; integrationId: string } | null> {
-    const rawProjectSlug = payload?.project_slug || payload?.project || payload?.data?.issue?.project?.slug;
-    const rawOrgSlug = payload?.organization_slug || payload?.data?.organization?.slug;
+    const rawProjectSlug = payload?.project_slug || payload?.project || payload?.data?.issue?.project?.slug || payload?.data?.project?.slug;
+    const rawOrgSlug = payload?.organization_slug || payload?.organization?.slug || payload?.data?.organization?.slug;
 
-    // 1. Try resolving by IncidentHub Project slug (exact or prefix match, newest first)
-    if (rawProjectSlug) {
-      const slugLower = rawProjectSlug.toLowerCase();
-      let projectMatch = await prisma.project.findFirst({
-        where: {
-          slug: slugLower,
-          organization: {
-            integrations: {
-              some: {
-                provider: IntegrationProvider.SENTRY,
-                status: IntegrationStatus.CONNECTED,
-              },
-            },
-          },
-        },
-        orderBy: { createdAt: 'desc' },
-        include: {
-          organization: {
-            include: {
-              integrations: {
-                where: {
-                  provider: IntegrationProvider.SENTRY,
-                  status: IntegrationStatus.CONNECTED,
-                },
-              },
-            },
-          },
-        },
-      });
-
-      if (!projectMatch) {
-        projectMatch = await prisma.project.findFirst({
-          where: {
-            slug: { startsWith: `${slugLower}-` },
-            organization: {
-              integrations: {
-                some: {
-                  provider: IntegrationProvider.SENTRY,
-                  status: IntegrationStatus.CONNECTED,
-                },
-              },
-            },
-          },
-          orderBy: { createdAt: 'desc' },
-          include: {
-            organization: {
-              include: {
-                integrations: {
-                  where: {
-                    provider: IntegrationProvider.SENTRY,
-                    status: IntegrationStatus.CONNECTED,
-                  },
-                },
-              },
-            },
-          },
-        });
-      }
-
-      if (projectMatch && projectMatch.organization.integrations[0]) {
-        return {
-          organizationId: projectMatch.organizationId,
-          integrationId: projectMatch.organization.integrations[0].id,
-        };
-      }
-    }
-
-    // 2. Try resolving by Sentry Organization Slug in Integration metadata (newest connected integration first)
+    // 1. Try resolving by Sentry Organization Slug in Integration metadata
     if (rawOrgSlug) {
       const orgSlugLower = rawOrgSlug.toLowerCase();
       const connectedIntegrations = await prisma.integration.findMany({
@@ -504,33 +449,76 @@ export class SentryService {
         orderBy: { updatedAt: 'desc' },
       });
 
-      const matchingIntegration = connectedIntegrations.find((integ) => {
+      const matchingIntegrations = connectedIntegrations.filter((integ) => {
         const meta = integ.metadata as { sentryOrgSlug?: string } | null;
         return meta?.sentryOrgSlug?.toLowerCase() === orgSlugLower;
       });
 
-      if (matchingIntegration) {
+      if (matchingIntegrations.length === 1 && matchingIntegrations[0]) {
         return {
-          organizationId: matchingIntegration.organizationId,
-          integrationId: matchingIntegration.id,
+          organizationId: matchingIntegrations[0].organizationId,
+          integrationId: matchingIntegrations[0].id,
         };
+      }
+
+      if (matchingIntegrations.length > 1) {
+        // If multiple orgs share same sentryOrgSlug, disambiguate via exact Project slug
+        if (rawProjectSlug) {
+          const projectSlugLower = rawProjectSlug.toLowerCase();
+          const candidateOrgIds = matchingIntegrations.map((i) => i.organizationId);
+          const matchingProjects = await prisma.project.findMany({
+            where: {
+              organizationId: { in: candidateOrgIds },
+              OR: [
+                { slug: projectSlugLower },
+                { slug: { startsWith: projectSlugLower } },
+                { name: { equals: rawProjectSlug, mode: 'insensitive' } },
+              ],
+            },
+          });
+          if (matchingProjects.length === 1 && matchingProjects[0]) {
+            const orgId = matchingProjects[0].organizationId;
+            const integ = matchingIntegrations.find((i) => i.organizationId === orgId);
+            if (integ) return { organizationId: orgId, integrationId: integ.id };
+          }
+        }
+        // Ambiguous match (>1 candidate) -> Fail closed!
+        logger.warn({ rawOrgSlug, rawProjectSlug }, 'Ambiguous Sentry organization match — failing closed');
+        return null;
       }
     }
 
-    // 3. Fallback for single-tenant context: If exactly ONE organization in DB has a connected Sentry integration
-    const connectedIntegrations = await prisma.integration.findMany({
-      where: {
-        provider: IntegrationProvider.SENTRY,
-        status: IntegrationStatus.CONNECTED,
-      },
-      orderBy: { updatedAt: 'desc' },
-    });
+    // 2. Try resolving by IncidentHub Project slug when org slug is absent
+    if (rawProjectSlug) {
+      const slugLower = rawProjectSlug.toLowerCase();
+      const matchingIntegrations = await prisma.integration.findMany({
+        where: {
+          provider: IntegrationProvider.SENTRY,
+          status: IntegrationStatus.CONNECTED,
+          organization: {
+            projects: {
+              some: {
+                OR: [
+                  { slug: slugLower },
+                  { slug: { startsWith: slugLower } },
+                  { name: { equals: rawProjectSlug, mode: 'insensitive' } },
+                ],
+              },
+            },
+          },
+        },
+      });
 
-    if (connectedIntegrations.length === 1 && connectedIntegrations[0]) {
-      return {
-        organizationId: connectedIntegrations[0].organizationId,
-        integrationId: connectedIntegrations[0].id,
-      };
+      if (matchingIntegrations.length === 1 && matchingIntegrations[0]) {
+        return {
+          organizationId: matchingIntegrations[0].organizationId,
+          integrationId: matchingIntegrations[0].id,
+        };
+      }
+
+      // If 0 or > 1 -> Ambiguous / unmapped, fail closed!
+      logger.warn({ rawProjectSlug, matchCount: matchingIntegrations.length }, 'Sentry project resolution failed or ambiguous — failing closed');
+      return null;
     }
 
     return null;
@@ -538,79 +526,67 @@ export class SentryService {
 
   /**
    * Ingests incoming Sentry webhook delivery, verifies signature & idempotency, normalizes signal,
-   * evaluates trigger rules, and optionally creates or flags an incident.
+   * evaluates trigger rules, and atomically creates or flags an incident with bounded concurrency retry.
    */
   public static async handleWebhookEvent(
     deliveryId: string,
     signature: string | undefined,
-    rawPayload: unknown,
-  ): Promise<{ status: string; issueId?: string; incidentId?: string }> {
-    const payload = rawPayload as SentryWebhookPayload;
-    const webhookSecret = process.env['SENTRY_WEBHOOK_SECRET'] || 'mock-sentry-webhook-secret';
-
-    // 1. HMAC Signature Verification (If in production or secret set)
-    if (signature && process.env['NODE_ENV'] === 'production') {
-      const isValid = this.verifySentrySignature(JSON.stringify(payload), signature, webhookSecret);
-      if (!isValid) {
-        logger.warn({ deliveryId }, 'Invalid Sentry webhook signature');
-        throw new ForbiddenError('Invalid Sentry webhook signature');
-      }
+    payload: SentryWebhookPayload,
+    rawBody?: string | Buffer,
+  ): Promise<{ status: 'processed' | 'duplicate' | 'ignored_unmapped' | 'ignored_unsupported'; issueId?: string; incidentId?: string }> {
+    const webhookSecret = process.env['SENTRY_WEBHOOK_SECRET'];
+    if (!webhookSecret) {
+      throw new ForbiddenError('Webhook secret not configured');
     }
 
-    // 2. Idempotency Check via ExternalEvent table — early check for known deliveries
-    const existingEvent = await prisma.externalEvent.findFirst({
-      where: {
-        provider: 'sentry',
-        externalId: deliveryId,
-      },
-    });
-
-    if (existingEvent) {
-      logger.info({ deliveryId }, 'Duplicate Sentry webhook delivery ignored (early check)');
-      return { status: 'ignored: duplicate delivery' };
+    // 1. HMAC Signature Verification
+    if (!signature) {
+      logger.warn({ deliveryId }, 'Missing Sentry webhook signature');
+      throw new ForbiddenError('Missing Sentry webhook signature');
+    }
+    const bodyToVerify = rawBody !== undefined ? rawBody : JSON.stringify(payload);
+    const isValid = this.verifySentrySignature(bodyToVerify, signature, webhookSecret);
+    if (!isValid) {
+      logger.warn({ deliveryId }, 'Invalid Sentry webhook signature');
+      throw new ForbiddenError('Invalid Sentry webhook signature');
     }
 
-    // 3. Resolve Organization & Integration deterministically (Tenant-Safe)
+    // 2. Validate payload is an object
+    if (!payload || typeof payload !== 'object') {
+      throw new ValidationError('Invalid Sentry webhook payload');
+    }
+
+    // 3. Resolve Organization & Integration deterministically (Tenant-Safe & Fail Closed)
     const tenant = await this.resolveWebhookTenant(payload);
     if (!tenant) {
       logger.warn({ deliveryId }, 'Unmapped Sentry webhook payload (tenant resolution failed)');
-      return { status: 'ignored: unmapped organization or project' };
+      return { status: 'ignored_unmapped' };
     }
 
     const { organizationId, integrationId } = tenant;
 
-    // Record ExternalEvent atomically — if duplicate delivery arrives concurrently, catch P2002 uniqueness violation
-    try {
-      await prisma.externalEvent.create({
-        data: {
-          organizationId,
-          integrationId,
-          provider: 'sentry',
-          externalId: deliveryId,
-          eventType: payload?.action || 'error_event',
-          payload: payload as unknown as Prisma.InputJsonValue,
-          occurredAt: new Date(),
-        },
-      });
-    } catch (createErr) {
-      // P2002 = unique constraint violation — another request already recorded this delivery
-      if (
-        createErr instanceof Prisma.PrismaClientKnownRequestError &&
-        createErr.code === 'P2002'
-      ) {
-        logger.info({ deliveryId }, 'Duplicate Sentry webhook delivery ignored (concurrent create race)');
-        return { status: 'ignored: duplicate delivery' };
-      }
-      throw createErr;
+    // 4. Idempotency Check via ExternalEvent table — early check for known processed deliveries
+    const existingEvent = await prisma.externalEvent.findUnique({
+      where: { provider_externalId: { provider: 'sentry', externalId: deliveryId } },
+    });
+    if (existingEvent && existingEvent.processedAt !== null) {
+      logger.info({ deliveryId }, 'Duplicate Sentry webhook delivery ignored');
+      return { status: 'duplicate' };
     }
 
-    // 3. Normalize Sentry Event Payload into SentryIssue
+    // 5. Normalize Sentry Event Payload
     const issueData: SentryWebhookIssue = payload?.issue ?? payload?.data?.issue ?? {};
     const eventData: SentryWebhookEvent = payload?.event ?? payload?.data?.event ?? {};
 
-    const sentryIssueId = String(issueData.id ?? eventData.issue_id ?? `sentry-issue-${Date.now()}`);
+    const projectSlug = payload?.project_slug || payload?.project || payload?.data?.issue?.project?.slug || 'default-project';
     const title = issueData.title ?? eventData.title ?? payload.message ?? 'Sentry Exception';
     const culprit = issueData.culprit ?? eventData.culprit ?? null;
+
+    const rawSentryIssueId = issueData.id ?? eventData.issue_id;
+    const sentryIssueId = rawSentryIssueId
+      ? String(rawSentryIssueId)
+      : crypto.createHash('sha256').update(`${organizationId}:${projectSlug}:${title}:${culprit || ''}`).digest('hex');
+
     const rawLevel = issueData.level ?? eventData.level ?? 'error';
     const level = rawLevel.toLowerCase();
     const userCount = Number(issueData.userCount ?? issueData.users ?? 1);
@@ -621,189 +597,287 @@ export class SentryService {
     const permalink = issueData.permalink ?? null;
     const stackTrace = eventData.culprit ?? issueData.culprit ?? title;
 
-    // Resolve mapped Project and Service in IncidentHub
-    const projectSlug = payload?.project_slug || payload?.project || payload?.data?.issue?.project?.slug || 'default-project';
-    const projectRecord = await prisma.project.findFirst({
-      where: { organizationId, slug: projectSlug.toLowerCase() },
-    });
+    // 6. Atomic Processing in Prisma Transaction with Bounded Concurrency Retry
+    let attempts = 5;
 
-    const sentryIssue = await prisma.sentryIssue.upsert({
-      where: {
-        organizationId_sentryIssueId: {
-          organizationId,
-          sentryIssueId,
-        },
-      },
-      create: {
-        organizationId,
-        integrationId,
-        sentryIssueId,
-        projectSlug,
-        title,
-        culprit,
-        level,
-        userCount,
-        eventCount,
-        release,
-        environment,
-        permalink,
-        stackTrace,
-        projectId: projectRecord?.id || null,
-      },
-      update: {
-        title,
-        culprit,
-        level,
-        userCount: { increment: 1 },
-        eventCount: { increment: 1 },
-        lastSeen: new Date(),
-        release,
-        environment,
-        permalink,
-        stackTrace,
-      },
-    });
+    while (attempts > 0) {
+      try {
+        const txResult = await prisma.$transaction(async (tx) => {
+          let createdIncidentBroadcast: { id: string; timelineId: string; message: string; occurredAt: Date } | null = null;
+          // Check existing or create delivery record atomically
+          const existing = await tx.externalEvent.findUnique({
+            where: { provider_externalId: { provider: 'sentry', externalId: deliveryId } },
+          });
 
-    // 4. Trigger Rule Evaluation Engine
-    const createdIncidentId = await this.evaluateTriggerRules(organizationId, sentryIssue);
+          if (existing && existing.processedAt !== null) {
+            return { isDuplicate: true, issueId: undefined, incidentId: undefined };
+          }
 
-    return {
-      status: 'processed',
-      issueId: sentryIssue.id,
-      incidentId: createdIncidentId,
-    };
-  }
+          let evt;
+          if (existing) {
+            evt = existing;
+          } else {
+            evt = await tx.externalEvent.create({
+              data: {
+                organizationId,
+                integrationId,
+                provider: 'sentry',
+                externalId: deliveryId,
+                eventType: payload?.action || 'error_event',
+                payload: payload as unknown as Prisma.InputJsonValue,
+                occurredAt: new Date(),
+                processedAt: null,
+              },
+            });
+          }
 
-  /**
-   * Evaluates active SentryRules for an organization against a SentryIssue signal.
-   * If threshold conditions match and autoCreateIncident is true, automatically creates an Incident.
-   */
-  private static async evaluateTriggerRules(organizationId: string, issue: Prisma.SentryIssueGetPayload<Record<string, never>>): Promise<string | undefined> {
-    const rules = await prisma.sentryRule.findMany({
-      where: { organizationId },
-    });
-
-    if (rules.length === 0) {
-      return undefined;
-    }
-
-    for (const rule of rules) {
-      const envMatch = !rule.environment || rule.environment.toLowerCase() === issue.environment.toLowerCase();
-      const levelMatch = !rule.levelFilter || rule.levelFilter.toLowerCase() === issue.level.toLowerCase();
-      const eventCountMatch = issue.eventCount >= rule.minEventCount;
-      const userCountMatch = issue.userCount >= rule.minUserCount;
-
-      if (envMatch && levelMatch && eventCountMatch && userCountMatch && rule.autoCreateIncident) {
-        // Deterministic severity mapping
-        const severity = (rule.mappedSeverity as IncidentSeverity) || this.mapSentryLevelToSeverity(issue.level);
-
-        // Check if open incident already exists for this Sentry issue
-        const existingEvidence = await prisma.incidentEvidence.findFirst({
-          where: {
-            type: EvidenceType.SENTRY_ERROR,
-            url: issue.permalink || undefined,
-            incident: {
+          // Resolve mapped project in the organization
+          const projectRecord = await tx.project.findFirst({
+            where: {
               organizationId,
-              status: { in: [IncidentStatus.OPEN, IncidentStatus.INVESTIGATING, IncidentStatus.MITIGATING] },
+              OR: [
+                { slug: projectSlug.toLowerCase() },
+                { slug: { startsWith: projectSlug.toLowerCase() } },
+                { name: { equals: projectSlug, mode: 'insensitive' } },
+              ],
             },
-          },
+          });
+
+          const sentryIssue = await tx.sentryIssue.upsert({
+            where: {
+              organizationId_sentryIssueId: {
+                organizationId,
+                sentryIssueId,
+              },
+            },
+            create: {
+              organizationId,
+              integrationId,
+              sentryIssueId,
+              projectSlug,
+              title,
+              culprit,
+              level,
+              userCount,
+              eventCount,
+              release,
+              environment,
+              permalink,
+              stackTrace,
+              projectId: projectRecord?.id || null,
+            },
+            update: {
+              title,
+              culprit,
+              level,
+              userCount: { increment: 1 },
+              eventCount: { increment: 1 },
+              lastSeen: new Date(),
+              release,
+              environment,
+              permalink,
+              stackTrace,
+            },
+          });
+
+          // Trigger Rule Evaluation in Transaction
+          let incidentId: string | undefined;
+          const rules = await tx.sentryRule.findMany({
+            where: { organizationId },
+          });
+
+          for (const rule of rules) {
+            const envMatch = !rule.environment || rule.environment.toLowerCase() === sentryIssue.environment.toLowerCase();
+            const levelMatch = !rule.levelFilter || rule.levelFilter.toLowerCase() === sentryIssue.level.toLowerCase();
+            const eventCountMatch = sentryIssue.eventCount >= rule.minEventCount;
+            const userCountMatch = sentryIssue.userCount >= rule.minUserCount;
+
+            if (envMatch && levelMatch && eventCountMatch && userCountMatch && rule.autoCreateIncident) {
+              const severity = (rule.mappedSeverity as IncidentSeverity) || this.mapSentryLevelToSeverity(sentryIssue.level);
+
+              // Check if open incident already exists for this Sentry issue
+              const existingEvidence = await tx.incidentEvidence.findFirst({
+                where: {
+                  type: EvidenceType.SENTRY_ERROR,
+                  externalRefId: sentryIssue.id,
+                  incident: {
+                    organizationId,
+                    status: { in: [IncidentStatus.OPEN, IncidentStatus.INVESTIGATING, IncidentStatus.MITIGATING] },
+                  },
+                },
+                select: { incidentId: true },
+              });
+
+              if (existingEvidence) {
+                logger.info({ issueId: sentryIssue.id, incidentId: existingEvidence.incidentId }, 'Sentry issue already linked to open incident');
+                incidentId = existingEvidence.incidentId;
+                break;
+              }
+
+              // Project & Service scoping checks (Objective 4.6)
+              let targetProjectId = sentryIssue.projectId;
+              let targetServiceId: string | undefined;
+
+              if (rule.projectId) {
+                const ruleProject = await tx.project.findFirst({
+                  where: { id: rule.projectId, organizationId },
+                });
+                if (ruleProject) {
+                  targetProjectId = ruleProject.id;
+                  if (rule.serviceId) {
+                    const ruleService = await tx.service.findFirst({
+                      where: { id: rule.serviceId, projectId: ruleProject.id },
+                    });
+                    if (ruleService) targetServiceId = ruleService.id;
+                  }
+                }
+              }
+
+              if (!targetProjectId) {
+                const firstProj = await tx.project.findFirst({ where: { organizationId } });
+                if (firstProj) targetProjectId = firstProj.id;
+              }
+
+              if (!targetProjectId) break;
+
+              const ownerMember = await tx.organizationMember.findFirst({
+                where: { organizationId, role: 'OWNER' },
+                select: { userId: true },
+              });
+
+              if (!ownerMember) break;
+
+              // Concurrency-safe sequential incident numbering inside transaction
+              const lastInc = await tx.incident.findFirst({
+                where: { organizationId },
+                orderBy: { number: 'desc' },
+                select: { number: true },
+              });
+              const nextNum = (lastInc?.number ?? 0) + 1;
+
+              const newInc = await tx.incident.create({
+                data: {
+                  organizationId,
+                  projectId: targetProjectId,
+                  serviceId: targetServiceId,
+                  number: nextNum,
+                  createdById: ownerMember.userId,
+                  title: `[Sentry Error Spike] ${sentryIssue.title}`,
+                  description: `Automated incident triggered by Sentry error rule "${rule.name}". Culprit: ${sentryIssue.culprit || 'Unknown'}. Events: ${sentryIssue.eventCount}, Users: ${sentryIssue.userCount}.`,
+                  severity,
+                  status: IncidentStatus.OPEN,
+                  environment: sentryIssue.environment.toUpperCase() === 'STAGING' ? IncidentEnvironment.STAGING : IncidentEnvironment.PRODUCTION,
+                },
+              });
+
+              const evidence = await tx.incidentEvidence.create({
+                data: {
+                  incidentId: newInc.id,
+                  type: EvidenceType.SENTRY_ERROR,
+                  source: EvidenceSource.CORRELATION_ENGINE,
+                  title: sentryIssue.title,
+                  description: `Sentry Issue #${sentryIssue.sentryIssueId} in ${sentryIssue.projectSlug}`,
+                  url: sentryIssue.permalink || `https://sentry.io/issues/${sentryIssue.sentryIssueId}/`,
+                  externalRefId: sentryIssue.id,
+                  confidence: 0.95,
+                  metadata: {
+                    sentryIssueId: sentryIssue.sentryIssueId,
+                    culprit: sentryIssue.culprit,
+                    level: sentryIssue.level,
+                    eventCount: sentryIssue.eventCount,
+                    userCount: sentryIssue.userCount,
+                    release: sentryIssue.release,
+                    environment: sentryIssue.environment,
+                  } satisfies Prisma.InputJsonObject,
+                },
+              });
+
+              const timelineEvent = await tx.incidentEvent.create({
+                data: {
+                  incidentId: newInc.id,
+                  organizationId,
+                  userId: ownerMember.userId,
+                  source: EventSource.SENTRY,
+                  type: 'SENTRY_SIGNAL_TRIGGERED',
+                  message: `Triggered by Sentry rule "${rule.name}": ${sentryIssue.title}`,
+                  metadata: { evidenceId: evidence.id, sentryIssueId: sentryIssue.sentryIssueId } satisfies Prisma.InputJsonObject,
+                },
+              });
+
+              incidentId = newInc.id;
+              createdIncidentBroadcast = {
+                id: newInc.id,
+                timelineId: timelineEvent.id,
+                message: timelineEvent.message,
+                occurredAt: timelineEvent.occurredAt,
+              };
+              break;
+            }
+          }
+
+          // Mark processedAt only upon successful commit
+          await tx.externalEvent.update({
+            where: { id: evt.id },
+            data: { processedAt: new Date() },
+          });
+
+          return { isDuplicate: false, issueId: sentryIssue.id, incidentId, broadcast: createdIncidentBroadcast };
         });
 
-        if (existingEvidence) {
-          logger.info({ issueId: issue.id, incidentId: existingEvidence.incidentId }, 'Sentry issue already linked to open incident');
-          return existingEvidence.incidentId;
-        }
-
-        // Get first project/service or fallback to issue's mapped project
-        const project = rule.projectId
-          ? await prisma.project.findUnique({ where: { id: rule.projectId } })
-          : await prisma.project.findFirst({ where: { organizationId } });
-
-        if (!project) return undefined;
-
-        // Auto-generate next sequential incident number
-        const lastInc = await prisma.incident.findFirst({
-          where: { organizationId },
-          orderBy: { number: 'desc' },
-          select: { number: true },
-        });
-
-        const nextNum = (lastInc?.number ?? 0) + 1;
-
-        // Resolve organization owner to satisfy createdById requirement
-        const ownerMember = await prisma.organizationMember.findFirst({
-          where: { organizationId, role: 'OWNER' },
-          select: { userId: true },
-        });
-
-        if (!ownerMember) return undefined;
-
-        const incident = await prisma.incident.create({
-          data: {
-            organizationId,
-            projectId: project.id,
-            serviceId: rule.serviceId || undefined,
-            number: nextNum,
-            createdById: ownerMember.userId,
-            title: `[Sentry Error Spike] ${issue.title}`,
-            description: `Automated incident triggered by Sentry error rule "${rule.name}". Culprit: ${issue.culprit || 'Unknown'}. Events: ${issue.eventCount}, Users: ${issue.userCount}.`,
-            severity,
-            status: IncidentStatus.OPEN,
-            environment: issue.environment.toUpperCase() === 'STAGING' ? IncidentEnvironment.STAGING : IncidentEnvironment.PRODUCTION,
-          },
-        });
-
-        // Attach IncidentEvidence
-        const evidence = await prisma.incidentEvidence.create({
-          data: {
-            incidentId: incident.id,
-            type: EvidenceType.SENTRY_ERROR,
-            source: EvidenceSource.CORRELATION_ENGINE,
-            title: issue.title,
-            description: `Sentry Issue #${issue.sentryIssueId} in ${issue.projectSlug}`,
-            url: issue.permalink || `https://sentry.io/issues/${issue.sentryIssueId}/`,
-            confidence: 0.95,
-            metadata: {
-              sentryIssueId: issue.sentryIssueId,
-              culprit: issue.culprit,
-              level: issue.level,
-              eventCount: issue.eventCount,
-              userCount: issue.userCount,
-              release: issue.release,
-              environment: issue.environment,
-            } satisfies Prisma.InputJsonObject,
-          },
-        });
-
-        // Add IncidentEvent audit timeline entry
-        const timelineEvent = await prisma.incidentEvent.create({
-          data: {
-            incidentId: incident.id,
+        // Post-commit Socket.IO broadcast and cache invalidation (Objective 4.8)
+        if (txResult.broadcast) {
+          broadcastToIncident(txResult.broadcast.id, SocketEvent.TIMELINE_EVENT, {
+            id: txResult.broadcast.timelineId,
+            incidentId: txResult.broadcast.id,
             organizationId,
             source: EventSource.SENTRY,
             type: 'SENTRY_SIGNAL_TRIGGERED',
-            message: `Triggered by Sentry rule "${rule.name}": ${issue.title}`,
-            metadata: { evidenceId: evidence.id, sentryIssueId: issue.sentryIssueId } satisfies Prisma.InputJsonObject,
-          },
-        });
+            message: txResult.broadcast.message,
+            timestamp: txResult.broadcast.occurredAt.toISOString(),
+          });
+          void invalidateAnalyticsCache(organizationId);
+        }
 
-        // Broadcast real-time Socket.IO room updates
-        broadcastToIncident(incident.id, SocketEvent.TIMELINE_EVENT, {
-          id: timelineEvent.id,
-          incidentId: incident.id,
-          organizationId,
-          source: EventSource.SENTRY,
-          type: 'SENTRY_SIGNAL_TRIGGERED',
-          message: timelineEvent.message,
-          timestamp: timelineEvent.occurredAt.toISOString(),
-        });
+        if (txResult.isDuplicate) {
+          return { status: 'duplicate' };
+        }
 
-        logger.info({ incidentId: incident.id, ruleName: rule.name }, 'Created incident from Sentry trigger rule');
-        return incident.id;
+        return {
+          status: 'processed',
+          issueId: txResult.issueId,
+          incidentId: txResult.incidentId,
+        };
+      } catch (err: unknown) {
+        const classification = classifyPrismaUniqueError(err);
+
+        if (classification === 'EXTERNAL_EVENT_DUPLICATE') {
+          logger.info({ deliveryId }, 'Duplicate Sentry webhook delivery race condition handled');
+          return { status: 'duplicate' };
+        }
+
+        if (classification === 'INCIDENT_NUMBER_CONFLICT') {
+          attempts--;
+          if (attempts > 0) {
+            logger.warn({ deliveryId, attemptsLeft: attempts }, 'Concurrent incident numbering conflict, retrying transaction');
+            continue;
+          }
+          throw new Error('Exhausted retry attempts for concurrent Sentry incident creation');
+        }
+
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2034') {
+          attempts--;
+          if (attempts > 0) {
+            continue;
+          }
+          throw new Error('Exhausted retry attempts for Sentry serialization conflict');
+        }
+
+        // Any other unrelated P2002 or unexpected error -> rethrow!
+        throw err;
       }
     }
 
-    return undefined;
+    throw new Error('Failed to process Sentry webhook after bounded retries');
   }
 
   /**

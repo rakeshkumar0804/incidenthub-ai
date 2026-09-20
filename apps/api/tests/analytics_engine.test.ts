@@ -304,9 +304,13 @@ describe('Phase 12 — Analytics & Engineering Intelligence Integration Tests', 
       const owner = await prisma.user.findFirstOrThrow({ where: { organizationMembers: { some: { organizationId: orgAId } } } });
 
       // Webhook event
+      const cryptoMod = await import('crypto');
+      const ghSecret = process.env['GITHUB_WEBHOOK_SECRET'] || 'test-github-webhook-secret-32chars-min!';
+      const rawPayloadStr = '{}';
+      const ghSig = `sha256=${cryptoMod.createHmac('sha256', ghSecret).update(rawPayloadStr).digest('hex')}`;
       await GitHubService.handleWebhookEvent(
-        '{}',
-        undefined,
+        rawPayloadStr,
+        ghSig,
         `delivery-${Date.now()}`,
         'push',
         { repository: { full_name: 'org/auth-service' } },

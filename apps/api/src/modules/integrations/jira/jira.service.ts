@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../../../lib/prisma';
 import { encryptText, decryptText } from '../../../utils/crypto';
-import { NotFoundError, ValidationError, ForbiddenError, AppError } from '../../../utils/errors';
+import { NotFoundError, ValidationError, ForbiddenError, AppError, classifyPrismaUniqueError } from '../../../utils/errors';
 import { logger } from '../../../utils/logger';
 import { env } from '../../../config/env';
 import { IntegrationProvider, IntegrationStatus, ActionItemStatus } from '@incidenthub/shared';
@@ -210,7 +210,7 @@ export class JiraService {
    */
   public static async createJiraIssueFromActionItem(
     organizationId: string,
-    _incidentId: string,
+    incidentId: string,
     actionItemId: string,
     projectKeyInput?: string,
   ): Promise<{ jiraIssueId: string; jiraIssueUrl: string; externalReferenceId: string }> {
@@ -222,12 +222,12 @@ export class JiraService {
       throw new ValidationError('Jira integration is not connected for this organization');
     }
 
-    const actionItem = await prisma.actionItem.findUnique({
-      where: { id: actionItemId },
+    const actionItem = await prisma.actionItem.findFirst({
+      where: { id: actionItemId, incidentId, organizationId },
     });
 
-    if (!actionItem || actionItem.organizationId !== organizationId) {
-      throw new NotFoundError('Action item not found');
+    if (!actionItem) {
+      throw new NotFoundError('Action item not found for this incident');
     }
 
     // 1. Idempotency check via ExternalReference
@@ -332,55 +332,66 @@ export class JiraService {
   /**
    * Handles Inbound Jira Webhook with Verification, Correlation Filtering, and Status Sync.
    */
-  public static async handleWebhook(reqHeaderSecret: string | undefined, payload: JiraWebhookPayload): Promise<{ status: string }> {
-    const webhookSecret = process.env['JIRA_WEBHOOK_SECRET'] || 'incidenthub-dev-jira-webhook-secret';
+  public static async handleWebhook(
+    reqHeaderSecret: string | undefined,
+    payload: JiraWebhookPayload,
+    deliveryId: string,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    _rawBody?: Buffer | string,
+  ): Promise<{ status: 'processed' | 'duplicate' | 'ignored_unmapped' | 'ignored_unsupported' }> {
+    const webhookSecret = process.env['JIRA_WEBHOOK_SECRET'];
+    if (!webhookSecret) {
+      throw new ForbiddenError('Webhook secret not configured');
+    }
 
-    if (process.env['NODE_ENV'] !== 'test' && reqHeaderSecret !== webhookSecret) {
+    if (!reqHeaderSecret) {
+      throw new ForbiddenError('Missing Jira webhook secret');
+    }
+    const sigBuf = Buffer.from(reqHeaderSecret, 'utf8');
+    const secretBuf = Buffer.from(webhookSecret, 'utf8');
+    const isValid = sigBuf.length === secretBuf.length && crypto.timingSafeEqual(sigBuf, secretBuf);
+    if (!isValid) {
       throw new ForbiddenError('Invalid Jira webhook secret');
     }
 
     if (!payload || !payload.issue || !payload.issue.key) {
-      return { status: 'ignored: malformed payload' };
+      return { status: 'ignored_unsupported' };
     }
 
     const issueKey = payload.issue.key;
     const jiraStatusName = payload.issue.fields?.status?.name || '';
-    const eventId = `jira-event-${payload.webhookEvent}-${issueKey}-${payload.timestamp || Date.now()}`;
 
-    // 1. ExternalEvent Idempotency Check
-    try {
-      await prisma.externalEvent.create({
-        data: {
-          organizationId: 'system-resolved',
-          provider: IntegrationProvider.JIRA,
-          externalId: eventId,
-          eventType: payload.webhookEvent || 'jira:issue_updated',
-          payload: payload as unknown as Prisma.InputJsonObject,
-          occurredAt: new Date(payload.timestamp || Date.now()),
-        },
-      });
-    } catch (err: unknown) {
-      if (typeof err === 'object' && err !== null && 'code' in err && (err as { code: string }).code === 'P2002') {
-        return { status: 'ignored: duplicate event' };
-      }
-    }
-
-    // Resolve target ExternalReference
+    // 1. Resolve Target Organization & ExternalReference (Tenant-Safe & Fail Closed)
     const ref = await prisma.externalReference.findFirst({
       where: {
         provider: IntegrationProvider.JIRA,
         externalResourceType: 'JIRA_ISSUE',
         externalId: issueKey,
+        integration: {
+          status: IntegrationStatus.CONNECTED,
+        },
+      },
+      include: {
+        integration: true,
       },
     });
 
     if (!ref) {
-      return { status: 'ignored: unmapped jira issue' };
+      logger.warn({ deliveryId, issueKey }, 'Unmapped Jira issue in webhook payload (tenant resolution failed)');
+      return { status: 'ignored_unmapped' };
     }
 
-    const refMeta = (ref.metadata as Record<string, unknown>) || {};
+    const { organizationId, integrationId } = ref;
 
-    // 2. Loop Prevention & Echo Filtering
+    // 2. Early Idempotency Check
+    const existing = await prisma.externalEvent.findUnique({
+      where: { provider_externalId: { provider: 'jira', externalId: deliveryId } },
+    });
+    if (existing && existing.processedAt !== null) {
+      return { status: 'duplicate' };
+    }
+
+    // 3. Map Jira status -> ActionItemStatus
     const mappedStatus =
       jiraStatusName.toLowerCase() === 'done' || jiraStatusName.toLowerCase() === 'closed' || jiraStatusName.toLowerCase() === 'resolved'
         ? ActionItemStatus.COMPLETED
@@ -388,32 +399,79 @@ export class JiraService {
         ? ActionItemStatus.IN_PROGRESS
         : null;
 
-    if (!mappedStatus) {
-      return { status: 'ignored: unmapped status' };
+    // 4. Echo check / loop prevention: if status is already synced, return duplicate
+    const refMeta = (ref.metadata as Record<string, unknown>) || {};
+    if (mappedStatus && String(refMeta['lastSyncedStatus']) === String(mappedStatus)) {
+      logger.info({ deliveryId, issueKey, mappedStatus }, 'Jira status already in sync — loop prevented');
+      return { status: 'duplicate' };
     }
 
-    // Timestamp / Echo Check: Drop if status is unchanged
-    if (String(refMeta['lastSyncedStatus']) === String(mappedStatus)) {
-      return { status: 'ignored: status echo no-op' };
+    // 5. Atomic Transaction Processing
+    try {
+      const txResult = await prisma.$transaction(async (tx) => {
+        const existingTx = await tx.externalEvent.findUnique({
+          where: { provider_externalId: { provider: 'jira', externalId: deliveryId } },
+        });
+
+        if (existingTx && existingTx.processedAt !== null) {
+          return { isDuplicate: true };
+        }
+
+        let evt;
+        if (existingTx) {
+          evt = existingTx;
+        } else {
+          evt = await tx.externalEvent.create({
+            data: {
+              organizationId,
+              integrationId,
+              provider: IntegrationProvider.JIRA,
+              externalId: deliveryId,
+              eventType: payload.webhookEvent || 'jira:issue_updated',
+              payload: payload as unknown as Prisma.InputJsonObject,
+              occurredAt: payload.timestamp ? new Date(payload.timestamp) : new Date(),
+              processedAt: null,
+            },
+          });
+        }
+
+        if (mappedStatus) {
+          await tx.actionItem.update({
+            where: { id: ref.entityId },
+            data: { status: mappedStatus },
+          });
+
+          await tx.externalReference.update({
+            where: { id: ref.id },
+            data: {
+              metadata: {
+                ...refMeta,
+                lastSyncedStatus: mappedStatus,
+              },
+            },
+          });
+        }
+
+        await tx.externalEvent.update({
+          where: { id: evt.id },
+          data: { processedAt: new Date() },
+        });
+
+        return { isDuplicate: false };
+      });
+
+      if (txResult.isDuplicate) {
+        return { status: 'duplicate' };
+      }
+
+      return { status: 'processed' };
+    } catch (err: unknown) {
+      const classification = classifyPrismaUniqueError(err);
+      if (classification === 'EXTERNAL_EVENT_DUPLICATE') {
+        logger.info({ deliveryId }, 'Duplicate Jira webhook delivery race condition handled');
+        return { status: 'duplicate' };
+      }
+      throw err;
     }
-
-    // Perform ActionItem status update
-    await prisma.actionItem.update({
-      where: { id: ref.entityId },
-      data: { status: mappedStatus },
-    });
-
-    // Update ExternalReference metadata timestamp & synced status
-    await prisma.externalReference.update({
-      where: { id: ref.id },
-      data: {
-        metadata: {
-          ...refMeta,
-          lastSyncedStatus: mappedStatus,
-        },
-      },
-    });
-
-    return { status: 'updated' };
   }
 }

@@ -183,7 +183,7 @@ describe('Phase 5: Real-Time Collaboration & Comments API', () => {
         });
 
         socket.on('error', (err: { message: string }) => {
-          expect(err.message).toContain('Forbidden');
+          expect(err.message).toContain('Access denied');
           socket.disconnect();
           resolve();
         });

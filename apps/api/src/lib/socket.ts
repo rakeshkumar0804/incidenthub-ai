@@ -95,6 +95,46 @@ export function initSocketServer(httpServer: HttpServer): Server {
   io.on('connection', (socket: CustomSocket) => {
     logger.info({ socketId: socket.id, userId: socket.data.user?.id }, 'Socket connected');
 
+    // Join Organization Room Handler
+    socket.on('join_organization', async (data: { organizationId?: string }) => {
+      try {
+        const organizationId = data?.organizationId;
+        if (!organizationId || typeof organizationId !== 'string') return;
+
+        const userId = socket.data.user.id;
+        const member = await prisma.organizationMember.findUnique({
+          where: {
+            organizationId_userId: {
+              organizationId,
+              userId,
+            },
+          },
+        });
+
+        if (!member) {
+          logger.warn({ userId, organizationId }, 'Cross-tenant organization room join rejected');
+          socket.emit('error', { message: 'Access denied: unable to join organization room' });
+          return;
+        }
+
+        await socket.join(`org:${organizationId}`);
+        logger.info({ userId, organizationId, socketId: socket.id }, 'Joined organization room');
+      } catch (err) {
+        logger.error({ err, socketId: socket.id }, 'Error joining organization room');
+      }
+    });
+
+    // Leave Organization Room Handler
+    socket.on('leave_organization', async (data: { organizationId?: string }) => {
+      try {
+        const organizationId = data?.organizationId;
+        if (!organizationId || typeof organizationId !== 'string') return;
+        await socket.leave(`org:${organizationId}`);
+      } catch (err) {
+        logger.error({ err, socketId: socket.id }, 'Error leaving organization room');
+      }
+    });
+
     // Join Incident Room Handler
     socket.on(SocketEvent.JOIN_INCIDENT, async (data: { incidentId?: string }) => {
       try {
@@ -103,33 +143,28 @@ export function initSocketServer(httpServer: HttpServer): Server {
 
         const userId = socket.data.user.id;
 
-        // 1. Verify incident exists
-        const incident = await prisma.incident.findUnique({
-          where: { id: incidentId },
+        // Tenant-scoped query: find incident where user is an active member of its organization
+        const incident = await prisma.incident.findFirst({
+          where: {
+            id: incidentId,
+            organization: {
+              members: {
+                some: {
+                  userId,
+                },
+              },
+            },
+          },
           select: { id: true, organizationId: true },
         });
 
         if (!incident) {
-          socket.emit('error', { message: 'Incident not found' });
-          return;
-        }
-
-        // 2. Verify user is a member of the organization that owns the incident
-        const member = await prisma.organizationMember.findUnique({
-          where: {
-            organizationId_userId: {
-              organizationId: incident.organizationId,
-              userId,
-            },
-          },
-        });
-
-        if (!member) {
           logger.warn(
-            { userId, incidentId, orgId: incident.organizationId },
-            'Cross-tenant room join rejected',
+            { userId, incidentId },
+            'Incident room join rejected: not found or cross-tenant access denied',
           );
-          socket.emit('error', { message: 'Forbidden: cross-tenant access denied' });
+          // Uniform rejection message that does not leak whether foreign resource exists
+          socket.emit('error', { message: 'Access denied: unable to join incident room' });
           return;
         }
 
@@ -178,11 +213,20 @@ export function initSocketServer(httpServer: HttpServer): Server {
   return io;
 }
 
-/**
- * Helper to broadcast an event payload to all sockets in an incident room.
- */
 export function broadcastToIncident(incidentId: string, event: SocketEvent | string, payload: unknown): void {
   if (ioInstance) {
     ioInstance.to(`incident:${incidentId}`).emit(event, payload);
+  }
+}
+
+export async function closeSocketServer(): Promise<void> {
+  if (ioInstance) {
+    const io = ioInstance;
+    ioInstance = null;
+    await new Promise<void>((resolve) => {
+      void io.close(() => {
+        resolve();
+      });
+    });
   }
 }

@@ -95,8 +95,15 @@ export function verifyGitHubWebhookSignature(
   const hmac = crypto.createHmac('sha256', secret);
   const digest = expectedPrefix + hmac.update(rawBody).digest('hex');
 
+  const sigBuf = Buffer.from(signatureHeader);
+  const digestBuf = Buffer.from(digest);
+
+  if (sigBuf.length !== digestBuf.length) {
+    return false;
+  }
+
   try {
-    return crypto.timingSafeEqual(Buffer.from(signatureHeader), Buffer.from(digest));
+    return crypto.timingSafeEqual(sigBuf, digestBuf);
   } catch {
     return false;
   }

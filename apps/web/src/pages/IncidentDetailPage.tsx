@@ -300,8 +300,13 @@ export const IncidentDetailPage: React.FC = () => {
           {/* Phase 9 AI Investigation Engine Section */}
           <AIInvestigationSection organizationId={activeOrg.organizationId} incidentId={incident.id} />
 
-          {/* Phase 10 Incident Replay Engine Section */}
-          <IncidentReplaySection organizationId={activeOrg.organizationId} incidentId={incident.id} />
+          {/* Incident Replay Engine Section */}
+          <IncidentReplaySection
+            organizationId={activeOrg.organizationId}
+            incidentId={incident.id}
+            incidentDetectedAt={incident.detectedAt}
+            incidentResolvedAt={incident.resolvedAt}
+          />
 
           {/* Phase 11 AI Postmortem Engine Section */}
           <PostmortemSection organizationId={activeOrg.organizationId} incidentId={incident.id} isViewer={isViewer} />

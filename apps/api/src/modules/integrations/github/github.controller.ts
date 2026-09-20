@@ -6,7 +6,8 @@ import {
   linkRepoSchema,
   linkIncidentActivitySchema,
 } from './github.schema';
-import { ValidationError, UnauthorizedError } from '../../../utils/errors';
+import { ValidationError, UnauthorizedError, ForbiddenError } from '../../../utils/errors';
+import { verifyGitHubWebhookSignature } from '../../../utils/crypto';
 import { logger } from '../../../utils/logger';
 import type { ApiSuccess } from '@incidenthub/shared';
 
@@ -239,10 +240,33 @@ export class GitHubController {
   public static async handleWebhook(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const signatureHeader = (req.headers['x-hub-signature-256'] as string) || undefined;
-      const deliveryId = (req.headers['x-github-delivery'] as string) || `delivery-${Date.now()}-${Math.random()}`;
-      const eventType = (req.headers['x-github-event'] as string) || 'push';
+      const rawBody = req.rawBody || (typeof req.body === 'string' ? Buffer.from(req.body, 'utf8') : Buffer.from(JSON.stringify(req.body)));
 
-      const rawBody = (req as Request & { rawBody?: Buffer | string }).rawBody || JSON.stringify(req.body);
+      // 1. Signature Verification Gate (Reject missing or invalid signatures with 403)
+      const webhookSecret = process.env['GITHUB_WEBHOOK_SECRET'];
+      if (!webhookSecret) {
+        throw new ForbiddenError('Webhook secret not configured');
+      }
+      if (!signatureHeader) {
+        throw new ForbiddenError('Missing GitHub webhook signature');
+      }
+      const isValid = verifyGitHubWebhookSignature(rawBody, signatureHeader, webhookSecret);
+      if (!isValid) {
+        throw new ForbiddenError('Invalid GitHub webhook signature');
+      }
+
+      // 2. Mandatory Delivery and Event Headers (Reject missing or blank headers with 400)
+      const deliveryHeader = req.headers['x-github-delivery'];
+      const deliveryId = typeof deliveryHeader === 'string' ? deliveryHeader.trim() : '';
+      if (!deliveryId) {
+        throw new ValidationError('Missing or blank X-GitHub-Delivery header');
+      }
+
+      const eventHeader = req.headers['x-github-event'];
+      const eventType = typeof eventHeader === 'string' ? eventHeader.trim() : '';
+      if (!eventType) {
+        throw new ValidationError('Missing or blank X-GitHub-Event header');
+      }
 
       const result = await GitHubService.handleWebhookEvent(
         rawBody,

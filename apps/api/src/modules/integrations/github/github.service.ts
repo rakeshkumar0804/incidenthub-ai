@@ -5,7 +5,7 @@ import { GitHubApiClient } from './githubClient';
 import { broadcastToIncident } from '../../../lib/socket';
 import { invalidateAnalyticsCache } from '../../analytics/analytics.service';
 import { logger } from '../../../utils/logger';
-import { NotFoundError, ValidationError, ForbiddenError } from '../../../utils/errors';
+import { NotFoundError, ValidationError, ForbiddenError, classifyPrismaUniqueError } from '../../../utils/errors';
 import {
   IntegrationProvider,
   IntegrationStatus,
@@ -825,65 +825,211 @@ export class GitHubService {
     eventType: string,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     payload: any,
-  ): Promise<{ status: string; eventId?: string }> {
-    const webhookSecret = process.env['GITHUB_WEBHOOK_SECRET'] || 'incidenthub-dev-webhook-secret';
-
-    // 1. Signature Verification
-    if (process.env['NODE_ENV'] !== 'test' && signatureHeader) {
-      const isValid = verifyGitHubWebhookSignature(rawBody, signatureHeader, webhookSecret);
-      if (!isValid) {
-        logger.warn({ deliveryId, eventType }, 'Invalid GitHub webhook signature');
-        throw new ForbiddenError('Invalid GitHub webhook signature');
-      }
+  ): Promise<{ status: 'processed' | 'duplicate' | 'ignored_unmapped' | 'ignored_unsupported'; eventId?: string }> {
+    const webhookSecret = process.env['GITHUB_WEBHOOK_SECRET'];
+    if (!webhookSecret) {
+      throw new ForbiddenError('Webhook secret not configured');
     }
 
-    // 2. Extract repository metadata & resolve target Organization
+    // 1. Signature Verification
+    if (!signatureHeader) {
+      logger.warn({ deliveryId, eventType }, 'Missing GitHub webhook signature');
+      throw new ForbiddenError('Missing GitHub webhook signature');
+    }
+    const isValid = verifyGitHubWebhookSignature(rawBody, signatureHeader, webhookSecret);
+    if (!isValid) {
+      logger.warn({ deliveryId, eventType }, 'Invalid GitHub webhook signature');
+      throw new ForbiddenError('Invalid GitHub webhook signature');
+    }
+
+    // 2. Validate payload structure
     const payloadObj = typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {};
     const repoObj = typeof payloadObj['repository'] === 'object' && payloadObj['repository'] !== null ? (payloadObj['repository'] as Record<string, unknown>) : {};
     const repoFullName = typeof repoObj['full_name'] === 'string' ? repoObj['full_name'] : undefined;
-    let organizationId: string | null = null;
+    const rawRepoId = repoObj['id'];
+    const repoId = typeof rawRepoId === 'number' || typeof rawRepoId === 'string' ? BigInt(rawRepoId) : undefined;
 
-    if (repoFullName) {
-      const repoRecord = await prisma.gitHubRepository.findFirst({
-        where: { fullName: repoFullName },
-        select: { organizationId: true, id: true },
+    // 3. Extract repository metadata & resolve target Organization (Fail Closed)
+    let organizationId: string | null = null;
+    let integrationId: string | null = null;
+    let repositoryRecord: { id: string; defaultBranch: string } | null = null;
+
+    if (repoFullName || repoId !== undefined) {
+      const matchingRepos = await prisma.gitHubRepository.findMany({
+        where: {
+          OR: [
+            ...(repoFullName ? [{ fullName: repoFullName }, { fullName: { endsWith: repoFullName.split('/')[1] || repoFullName } }] : []),
+            ...(repoId !== undefined ? [{ githubRepoId: repoId }] : []),
+          ],
+        },
+        include: { integration: true },
+        orderBy: { updatedAt: 'desc' },
       });
-      if (repoRecord) {
-        organizationId = repoRecord.organizationId;
+
+      const connectedRepos = matchingRepos.filter((r) => String(r.integration?.status) === String(IntegrationStatus.CONNECTED));
+      const candidates = connectedRepos.length > 0 ? connectedRepos : matchingRepos;
+
+      if (candidates.length >= 1 && candidates[0]) {
+        organizationId = candidates[0].organizationId;
+        integrationId = candidates[0].integrationId;
+        repositoryRecord = candidates[0];
       }
     }
 
     if (!organizationId) {
-      const firstOrg = await prisma.organization.findFirst({ select: { id: true } });
-      if (!firstOrg) {
-        logger.warn({ deliveryId }, 'No organization found for incoming webhook');
-        return { status: 'ignored: no organization' };
+      const rawInstId = (payloadObj['installation'] as Record<string, unknown> | undefined)?.['id'];
+      const installationId = typeof rawInstId === 'string' || typeof rawInstId === 'number' ? String(rawInstId) : undefined;
+      if (installationId) {
+        const matchingIntegrations = await prisma.integration.findMany({
+          where: {
+            provider: IntegrationProvider.GITHUB,
+            status: IntegrationStatus.CONNECTED,
+          },
+          orderBy: { updatedAt: 'desc' },
+        });
+        const matched = matchingIntegrations.filter((integ) => {
+          const meta = integ.metadata as { installationId?: number | string } | null;
+          return meta?.installationId !== undefined && String(meta.installationId) === installationId;
+        });
+        if (matched.length >= 1 && matched[0]) {
+          organizationId = matched[0].organizationId;
+          integrationId = matched[0].id;
+        }
       }
-      organizationId = firstOrg.id;
     }
 
-    // 3. Idempotency Check via ExternalEvent table
+    if (!organizationId) {
+      logger.warn({ deliveryId, repoFullName }, 'Unmapped GitHub repository webhook event (no organization found)');
+      return { status: 'ignored_unmapped' };
+    }
+
+    // 4. Idempotency Check via ExternalEvent table — early check for known processed deliveries
+    const existingEvent = await prisma.externalEvent.findUnique({
+      where: { provider_externalId: { provider: 'github', externalId: deliveryId } },
+    });
+    if (existingEvent && existingEvent.processedAt !== null) {
+      logger.info({ deliveryId }, 'Duplicate GitHub webhook delivery ignored');
+      return { status: 'duplicate', eventId: existingEvent.id };
+    }
+
+    // 5. Derive occurredAt timestamp
+    const timestampStr =
+      (payloadObj['head_commit'] as Record<string, unknown> | undefined)?.['timestamp'] ||
+      (payloadObj['pull_request'] as Record<string, unknown> | undefined)?.['updated_at'] ||
+      (payloadObj['deployment'] as Record<string, unknown> | undefined)?.['updated_at'] ||
+      (payloadObj['workflow_run'] as Record<string, unknown> | undefined)?.['updated_at'];
+    const occurredAt = typeof timestampStr === 'string' ? new Date(timestampStr) : new Date();
+
+    // 6. Atomic Processing in Prisma Transaction
     try {
-      const eventRecord = await prisma.externalEvent.create({
-        data: {
-          organizationId,
-          provider: 'github',
-          externalId: deliveryId,
-          eventType,
-          payload: payload as object,
-          occurredAt: new Date(),
-          processedAt: new Date(),
-        },
+      const txResult = await prisma.$transaction(async (tx) => {
+        // Check existing delivery record
+        const existing = await tx.externalEvent.findUnique({
+          where: { provider_externalId: { provider: 'github', externalId: deliveryId } },
+        });
+
+        if (existing && existing.processedAt !== null) {
+          return { isDuplicate: true, eventId: existing.id };
+        }
+
+        let evt;
+        if (existing) {
+          evt = existing;
+        } else {
+          evt = await tx.externalEvent.create({
+            data: {
+              organizationId,
+              integrationId,
+              provider: 'github',
+              externalId: deliveryId,
+              eventType,
+              payload: payload as object,
+              occurredAt,
+              processedAt: null,
+            },
+          });
+        }
+
+        // Downstream parsing if repository is mapped
+        if (repositoryRecord) {
+          if (eventType === 'push' && Array.isArray(payloadObj['commits'])) {
+            const commits = payloadObj['commits'] as Array<Record<string, unknown>>;
+            for (const c of commits) {
+              if (c && typeof c.id === 'string') {
+                const authorObj = c.author as Record<string, unknown> | undefined;
+                await tx.gitHubCommit.upsert({
+                  where: { repositoryId_sha: { repositoryId: repositoryRecord.id, sha: c.id } },
+                  create: {
+                    repositoryId: repositoryRecord.id,
+                    sha: c.id,
+                    authorName: (typeof authorObj?.['name'] === 'string' ? authorObj['name'] : 'GitHub User'),
+                    authorEmail: (typeof authorObj?.['email'] === 'string' ? authorObj['email'] : null),
+                    message: (typeof c['message'] === 'string' ? c['message'] : ''),
+                    branch: (typeof payloadObj['ref'] === 'string' ? payloadObj['ref'].replace('refs/heads/', '') : repositoryRecord.defaultBranch),
+                    url: (typeof c['url'] === 'string' ? c['url'] : `https://github.com/${repoFullName}/commit/${c.id}`),
+                    committedAt: typeof c['timestamp'] === 'string' ? new Date(c['timestamp']) : new Date(),
+                  },
+                  update: {
+                    message: typeof c['message'] === 'string' ? c['message'] : '',
+                  },
+                });
+              }
+            }
+          } else if (eventType === 'pull_request' && typeof payloadObj['pull_request'] === 'object' && payloadObj['pull_request'] !== null) {
+            const pr = payloadObj['pull_request'] as Record<string, unknown>;
+            if (typeof pr['number'] === 'number') {
+              const headObj = pr['head'] as Record<string, unknown> | undefined;
+              const baseObj = pr['base'] as Record<string, unknown> | undefined;
+              const userObj = pr['user'] as Record<string, unknown> | undefined;
+              await tx.gitHubPullRequest.upsert({
+                where: { repositoryId_number: { repositoryId: repositoryRecord.id, number: pr['number'] } },
+                create: {
+                  repositoryId: repositoryRecord.id,
+                  number: pr['number'],
+                  title: (typeof pr['title'] === 'string' ? pr['title'] : ''),
+                  state: pr['merged_at'] ? 'merged' : (typeof pr['state'] === 'string' ? pr['state'] : 'open'),
+                  author: (typeof userObj?.['login'] === 'string' ? userObj['login'] : 'unknown'),
+                  branch: (typeof headObj?.['ref'] === 'string' ? headObj['ref'] : 'feature'),
+                  targetBranch: (typeof baseObj?.['ref'] === 'string' ? baseObj['ref'] : 'main'),
+                  url: (typeof pr['html_url'] === 'string' ? pr['html_url'] : ''),
+                  createdAt: typeof pr['created_at'] === 'string' ? new Date(pr['created_at']) : new Date(),
+                  updatedAt: typeof pr['updated_at'] === 'string' ? new Date(pr['updated_at']) : new Date(),
+                  mergedAt: typeof pr['merged_at'] === 'string' ? new Date(pr['merged_at']) : null,
+                  closedAt: typeof pr['closed_at'] === 'string' ? new Date(pr['closed_at']) : null,
+                },
+                update: {
+                  title: typeof pr['title'] === 'string' ? pr['title'] : '',
+                  state: pr['merged_at'] ? 'merged' : (typeof pr['state'] === 'string' ? pr['state'] : 'open'),
+                  updatedAt: typeof pr['updated_at'] === 'string' ? new Date(pr['updated_at']) : new Date(),
+                  mergedAt: typeof pr['merged_at'] === 'string' ? new Date(pr['merged_at']) : null,
+                },
+              });
+            }
+          }
+        }
+
+        // Mark processedAt only upon successful completion
+        const completed = await tx.externalEvent.update({
+          where: { id: evt.id },
+          data: { processedAt: new Date() },
+        });
+
+        return { isDuplicate: false, eventId: completed.id };
       });
+
+      if (txResult.isDuplicate) {
+        return { status: 'duplicate', eventId: txResult.eventId };
+      }
 
       logger.info({ deliveryId, eventType, organizationId }, 'Processed GitHub webhook event');
       void invalidateAnalyticsCache(organizationId);
 
-      return { status: 'processed', eventId: eventRecord.id };
+      return { status: 'processed', eventId: txResult.eventId };
     } catch (err: unknown) {
-      if (typeof err === 'object' && err !== null && 'code' in err && (err as { code: string }).code === 'P2002') {
-        logger.info({ deliveryId }, 'Duplicate GitHub webhook delivery ignored');
-        return { status: 'ignored: duplicate delivery' };
+      const classification = classifyPrismaUniqueError(err);
+      if (classification === 'EXTERNAL_EVENT_DUPLICATE') {
+        logger.info({ deliveryId }, 'Duplicate GitHub webhook delivery race condition handled');
+        return { status: 'duplicate' };
       }
       throw err;
     }
@@ -912,28 +1058,36 @@ export class GitHubService {
     let metadata: Record<string, unknown> = {};
 
     if (input.activityType === 'GITHUB_COMMIT') {
-      const commit = await prisma.gitHubCommit.findUnique({ where: { id: input.activityId } });
+      const commit = await prisma.gitHubCommit.findFirst({
+        where: { id: input.activityId, repository: { organizationId } },
+      });
       if (!commit) throw new NotFoundError('GitHub commit not found');
       title = `Commit: ${commit.sha.substring(0, 7)} — ${commit.message.split('\n')[0]}`;
       description = `Author: ${commit.authorName} | Branch: ${commit.branch}`;
       url = commit.url;
       metadata = { sha: commit.sha, author: commit.authorName, branch: commit.branch };
     } else if (input.activityType === 'GITHUB_PR') {
-      const pr = await prisma.gitHubPullRequest.findUnique({ where: { id: input.activityId } });
+      const pr = await prisma.gitHubPullRequest.findFirst({
+        where: { id: input.activityId, repository: { organizationId } },
+      });
       if (!pr) throw new NotFoundError('GitHub pull request not found');
       title = `PR #${pr.number}: ${pr.title}`;
       description = `State: ${pr.state} | Author: ${pr.author} | ${pr.branch} -> ${pr.targetBranch}`;
       url = pr.url;
       metadata = { prNumber: pr.number, state: pr.state, author: pr.author };
     } else if (input.activityType === 'GITHUB_DEPLOYMENT') {
-      const dep = await prisma.gitHubDeployment.findUnique({ where: { id: input.activityId } });
+      const dep = await prisma.gitHubDeployment.findFirst({
+        where: { id: input.activityId, repository: { organizationId } },
+      });
       if (!dep) throw new NotFoundError('GitHub deployment not found');
       title = `Deployment to ${dep.environment} (${dep.state})`;
       description = `Commit: ${dep.commitSha.substring(0, 7)} | Triggered by: ${dep.creator}`;
       url = dep.url;
       metadata = { deploymentId: dep.deploymentId, environment: dep.environment, state: dep.state };
     } else if (input.activityType === 'GITHUB_WORKFLOW_RUN') {
-      const wf = await prisma.gitHubWorkflowRun.findUnique({ where: { id: input.activityId } });
+      const wf = await prisma.gitHubWorkflowRun.findFirst({
+        where: { id: input.activityId, repository: { organizationId } },
+      });
       if (!wf) throw new NotFoundError('GitHub workflow run not found');
       title = `Workflow: ${wf.name} (${wf.conclusion || wf.status})`;
       description = `Event: ${wf.event} | Branch: ${wf.branch} | Commit: ${wf.commitSha.substring(0, 7)}`;

@@ -20,6 +20,7 @@ declare global {
         organizationId: string;
         role: import('@incidenthub/shared').OrgRole;
       };
+      rawBody?: Buffer;
     }
   }
 }

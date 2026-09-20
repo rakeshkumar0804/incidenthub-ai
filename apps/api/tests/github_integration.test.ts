@@ -251,6 +251,28 @@ describe('Phase 6 — GitHub Integration Tests', () => {
 
   describe('4. Webhook Receiver & Idempotency', () => {
     const deliveryId = `deliv-test-${Date.now()}`;
+    const webhookSecret = process.env['GITHUB_WEBHOOK_SECRET'] || 'test-github-webhook-secret-phase1-audit';
+
+    it('rejects webhook with missing signature (403)', async () => {
+      const res = await request
+        .post('/api/v1/webhooks/github')
+        .set('x-github-delivery', `missing-sig-${Date.now()}`)
+        .set('x-github-event', 'push')
+        .send({ repository: { full_name: 'acme/payment-service' } });
+
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects webhook with invalid signature (403)', async () => {
+      const res = await request
+        .post('/api/v1/webhooks/github')
+        .set('x-github-delivery', `bad-sig-${Date.now()}`)
+        .set('x-github-event', 'push')
+        .set('x-hub-signature-256', 'sha256=11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff')
+        .send({ repository: { full_name: 'acme/payment-service' } });
+
+      expect(res.status).toBe(403);
+    });
 
     it('processes valid webhook push payload and enforces idempotency', async () => {
       const payload = {
@@ -265,9 +287,14 @@ describe('Phase 6 — GitHub Integration Tests', () => {
           },
         ],
       };
+      const rawPayload = JSON.stringify(payload);
+      const hmac = crypto.createHmac('sha256', webhookSecret).update(rawPayload).digest('hex');
+      const signature = `sha256=${hmac}`;
 
       const res1 = await request
         .post('/api/v1/webhooks/github')
+        .set('Content-Type', 'application/json')
+        .set('x-hub-signature-256', signature)
         .set('x-github-delivery', deliveryId)
         .set('x-github-event', 'push')
         .send(payload);
@@ -279,13 +306,15 @@ describe('Phase 6 — GitHub Integration Tests', () => {
       // Duplicate delivery should be ignored safely
       const res2 = await request
         .post('/api/v1/webhooks/github')
+        .set('Content-Type', 'application/json')
+        .set('x-hub-signature-256', signature)
         .set('x-github-delivery', deliveryId)
         .set('x-github-event', 'push')
         .send(payload);
 
       const body2 = res2.body as TestRes<{ status: string }>;
       expect(res2.status).toBe(200);
-      expect(body2.data.status).toBe('ignored: duplicate delivery');
+      expect(body2.data.status).toBe('duplicate');
     });
   });
 

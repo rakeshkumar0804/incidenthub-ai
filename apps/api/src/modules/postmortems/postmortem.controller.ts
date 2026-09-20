@@ -135,9 +135,9 @@ export class PostmortemController {
     next: NextFunction,
   ): Promise<void> => {
     try {
-      const { organizationId, actionItemId } = req.params;
-      if (!organizationId || !actionItemId) {
-        throw new ValidationError('Organization ID and Action Item ID are required');
+      const { organizationId, incidentId, actionItemId } = req.params;
+      if (!organizationId || !incidentId || !actionItemId) {
+        throw new ValidationError('Organization ID, Incident ID, and Action Item ID are required');
       }
 
       const parseResult = updateActionItemSchema.safeParse(req.body);
@@ -147,6 +147,7 @@ export class PostmortemController {
 
       const updated = await PostmortemService.updateActionItem(
         organizationId,
+        incidentId,
         actionItemId,
         parseResult.data,
       );

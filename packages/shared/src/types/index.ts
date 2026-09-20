@@ -10,7 +10,14 @@
  * - Types only — no implementations
  */
 
-import type { PostmortemStatus, ActionItemPriority, ActionItemStatus, IntegrationProvider } from '../enums';
+import type {
+  PostmortemStatus,
+  ActionItemPriority,
+  ActionItemStatus,
+  IntegrationProvider,
+  EvidenceConfidenceTier,
+  CorrelationRunStatus,
+} from '../enums';
 
 // =============================================================================
 // API Response Envelope
@@ -28,6 +35,7 @@ export interface ApiError {
   error: {
     code: string;
     message: string;
+    requestId?: string;
     details?: unknown;
   };
 }
@@ -559,8 +567,6 @@ export interface LinkSentryIssueInput {
 // Correlation Engine DTOs (Phase 8)
 // =============================================================================
 
-export type CorrelationRunStatus = 'RUNNING' | 'COMPLETED' | 'FAILED';
-export type EvidenceConfidenceTier = 'HIGH' | 'MEDIUM' | 'LOW';
 export type CorrelationTriggerType =
   | 'AUTOMATIC_INCIDENT_CREATED'
   | 'AUTOMATIC_INCIDENT_UPDATED'
@@ -577,6 +583,10 @@ export interface CorrelationReasonsDto {
   commitRelation: boolean;
   sentrySpike: boolean;
   workflowFailure: boolean;
+  temporalRelation?: 'PRECURSOR' | 'POST_INCIDENT';
+  minutesFromDetection?: number;
+  precursor?: boolean;
+  postIncident?: boolean;
 }
 
 export interface IncidentEvidenceDto {
@@ -696,6 +706,19 @@ export interface TriggerInvestigationInput {
   triggerType?: InvestigationTriggerType;
 }
 
+export interface LatestInvestigationFailureDto {
+  error: string | null;
+  failedAt: ISOTimestamp | null;
+}
+
+export interface GetLatestInvestigationResponseDto {
+  incidentId: string;
+  latestRun: InvestigationRunDto | null;
+  latestCompletedRun: InvestigationRunDto | null;
+  isRunning: boolean;
+  latestFailure: LatestInvestigationFailureDto | null;
+}
+
 // =============================================================================
 // Incident Replay Engine DTOs (Phase 10)
 // =============================================================================
@@ -747,6 +770,14 @@ export interface ReplayRunDto {
   triggeredById: string | null;
   startedAt: ISOTimestamp;
   completedAt: ISOTimestamp | null;
+}
+
+export interface LatestReplayResponseDto {
+  incidentId: string;
+  latestRun: ReplayRunDto | null;
+  latestCompletedRun: (ReplayRunDto & { events: ReplayEventDto[] }) | null;
+  latestFailure: { runId: string; error: string; completedAt: ISOTimestamp } | null;
+  isRunning: boolean;
 }
 
 export interface TriggerReplayInput {
@@ -847,11 +878,50 @@ export interface PostmortemDto {
   updatedAt: ISOTimestamp;
 }
 
+export interface PostmortemRunDto {
+  id: string;
+  organizationId: string;
+  incidentId: string;
+  postmortemId: string | null;
+  triggerType: PostmortemTriggerType;
+  status: InvestigationStatus;
+  providerName: string;
+  modelName: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  latencyMs: number;
+  error: string | null;
+  triggeredById: string | null;
+  startedAt: ISOTimestamp;
+  completedAt: ISOTimestamp | null;
+}
+
+export interface LatestPostmortemFailureDto {
+  runId: string;
+  error: string;
+  completedAt: ISOTimestamp | null;
+}
+
+export interface GetPostmortemResponseDto {
+  incidentId: string;
+  postmortem: PostmortemDto | null;
+  activeVersion: PostmortemVersionDto | null;
+  versions: PostmortemVersionDto[];
+  actionItems: ActionItemDto[];
+  latestRun: PostmortemRunDto | null;
+  latestCompletedRun: PostmortemRunDto | null;
+  latestFailure: LatestPostmortemFailureDto | null;
+  isRunning: boolean;
+  isGenerating?: boolean;
+}
+
 export interface GeneratePostmortemInput {
   triggerType?: PostmortemTriggerType;
 }
 
 export interface UpdatePostmortemInput {
+  baseVersionId: string;
   summary?: string;
   impact?: string;
   incidentTimeline?: string;

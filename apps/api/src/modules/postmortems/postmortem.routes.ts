@@ -1,15 +1,12 @@
 import { Router } from 'express';
-import { authenticate, requireOrgMember } from '../../middleware/auth';
-import { requirePermission } from '../../middleware/rbac';
+import { authenticate } from '../../middleware/auth';
+import { requireOrgIncidentPermission } from '../../middleware/resourceAuth';
 import { PostmortemController } from './postmortem.controller';
 
 const router = Router({ mergeParams: true });
 
 router.use((req, res, next) => {
   void authenticate(req, res, next);
-});
-router.use((req, res, next) => {
-  void requireOrgMember(req, res, next);
 });
 
 /**
@@ -18,7 +15,9 @@ router.use((req, res, next) => {
  */
 router.post(
   '/',
-  requirePermission('incidents:update'),
+  (req, res, next) => {
+    void requireOrgIncidentPermission('incidents:update')(req, res, next);
+  },
   (req, res, next) => {
     void PostmortemController.generatePostmortem(req, res, next);
   },
@@ -26,7 +25,9 @@ router.post(
 
 router.post(
   '/generate',
-  requirePermission('incidents:update'),
+  (req, res, next) => {
+    void requireOrgIncidentPermission('incidents:update')(req, res, next);
+  },
   (req, res, next) => {
     void PostmortemController.generatePostmortem(req, res, next);
   },
@@ -38,7 +39,9 @@ router.post(
  */
 router.get(
   '/',
-  requirePermission('incidents:read'),
+  (req, res, next) => {
+    void requireOrgIncidentPermission('incidents:read')(req, res, next);
+  },
   (req, res, next) => {
     void PostmortemController.getPostmortem(req, res, next);
   },
@@ -50,7 +53,9 @@ router.get(
  */
 router.patch(
   '/',
-  requirePermission('incidents:update'),
+  (req, res, next) => {
+    void requireOrgIncidentPermission('incidents:update')(req, res, next);
+  },
   (req, res, next) => {
     void PostmortemController.updatePostmortem(req, res, next);
   },
@@ -62,7 +67,9 @@ router.patch(
  */
 router.post(
   '/action-items',
-  requirePermission('incidents:update'),
+  (req, res, next) => {
+    void requireOrgIncidentPermission('incidents:update')(req, res, next);
+  },
   (req, res, next) => {
     void PostmortemController.createActionItem(req, res, next);
   },
@@ -74,7 +81,9 @@ router.post(
  */
 router.patch(
   '/action-items/:actionItemId',
-  requirePermission('incidents:update'),
+  (req, res, next) => {
+    void requireOrgIncidentPermission('incidents:update')(req, res, next);
+  },
   (req, res, next) => {
     void PostmortemController.updateActionItem(req, res, next);
   },

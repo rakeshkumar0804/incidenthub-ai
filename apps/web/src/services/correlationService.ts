@@ -9,6 +9,7 @@ import type {
 export interface CorrelationEvidenceResponse {
   incidentId: string;
   latestRun: CorrelationRunDto | null;
+  latestCompletedRun?: CorrelationRunDto | null;
   evidence: IncidentEvidenceDto[];
 }
 

@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { JiraService } from './jira.service';
 import { ValidationError } from '../../../utils/errors';
@@ -75,8 +76,22 @@ export class JiraController {
 
   public static handleWebhook = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const secretHeader = typeof req.headers['x-atlassian-webhook-secret'] === 'string' ? req.headers['x-atlassian-webhook-secret'] : undefined;
-      const result = await JiraService.handleWebhook(secretHeader, req.body as JiraWebhookPayload);
+      const secretHeader =
+        (typeof req.headers['x-atlassian-webhook-secret'] === 'string' && req.headers['x-atlassian-webhook-secret']) ||
+        (typeof req.headers['x-jira-webhook-secret'] === 'string' && req.headers['x-jira-webhook-secret']) ||
+        undefined;
+      const headerDelivery = typeof req.headers['x-atlassian-webhook-identifier'] === 'string' ? req.headers['x-atlassian-webhook-identifier'] : undefined;
+      const rawBody = req.rawBody || (typeof req.body === 'string' ? Buffer.from(req.body, 'utf8') : Buffer.from(JSON.stringify(req.body)));
+
+      let deliveryId: string;
+      if (headerDelivery && headerDelivery.length > 0) {
+        deliveryId = headerDelivery;
+      } else {
+        const rawBuf = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(typeof rawBody === 'string' ? rawBody : JSON.stringify(req.body), 'utf8');
+        deliveryId = `jira-${crypto.createHash('sha256').update(rawBuf).digest('hex')}`;
+      }
+
+      const result = await JiraService.handleWebhook(secretHeader, req.body as JiraWebhookPayload, deliveryId, rawBody);
       res.status(200).json({ success: true, data: result });
     } catch (error) {
       next(error);

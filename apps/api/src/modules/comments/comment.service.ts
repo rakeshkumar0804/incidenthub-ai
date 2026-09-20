@@ -53,7 +53,7 @@ export class CommentService {
 
     const comments = await prisma.comment.findMany({
       where: { incidentId },
-      orderBy: { createdAt: 'asc' },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       include: {
         user: {
           select: {

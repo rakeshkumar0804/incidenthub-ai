@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { prisma } from '../../lib/prisma';
 import { hashPassword, comparePassword, hashToken, generateRandomToken } from '../../utils/crypto';
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../../utils/jwt';
-import { ConflictError, UnauthorizedError, ValidationError, NotFoundError, ForbiddenError } from '../../utils/errors';
+import { ConflictError, UnauthorizedError, ValidationError, NotFoundError } from '../../utils/errors';
 import { OrgRole } from '@incidenthub/shared';
 import type { UserDto, OrgMemberDto, AuthResponseData } from '@incidenthub/shared';
 import type { RegisterInput, LoginInput, ResetPasswordInput } from './auth.schema';
@@ -53,13 +53,6 @@ function formatOrgMemberDto(member: {
   };
 }
 
-function sortOrganizationsPrioritizingAcme<T extends { organization: { slug: string; name: string } }>(orgs: T[]): T[] {
-  return [...orgs].sort((a, b) => {
-    if (a.organization.slug === 'acme-engineering' || a.organization.name === 'Acme Engineering') return -1;
-    if (b.organization.slug === 'acme-engineering' || b.organization.name === 'Acme Engineering') return 1;
-    return 0;
-  });
-}
 
 
 export class AuthService {
@@ -139,42 +132,11 @@ export class AuthService {
       },
     });
 
-    // Auto-link newly registered user to Acme Engineering if present
-    const acmeOrg = await prisma.organization.findUnique({
-      where: { slug: 'acme-engineering' },
-    });
-
-    let acmeMember = null;
-    if (acmeOrg) {
-      acmeMember = await prisma.organizationMember.upsert({
-        where: {
-          organizationId_userId: {
-            organizationId: acmeOrg.id,
-            userId: result.user.id,
-          },
-        },
-        update: {},
-        create: {
-          organizationId: acmeOrg.id,
-          userId: result.user.id,
-          role: OrgRole.ADMIN,
-        },
-        include: { organization: true },
-      });
-    }
-
-    const allMembers = [
-      ...(acmeMember ? [acmeMember] : []),
-      result.member,
-    ];
-    const sortedMembers = sortOrganizationsPrioritizingAcme(allMembers);
-    const activeOrganizationId = sortedMembers[0]?.organizationId || result.member.organizationId;
-
     const authData: AuthResponseData = {
       user: formatUserDto(result.user),
       accessToken,
-      activeOrganizationId,
-      organizations: sortedMembers.map(formatOrgMemberDto),
+      activeOrganizationId: result.member.organizationId,
+      organizations: [formatOrgMemberDto(result.member)],
     };
 
     return {
@@ -183,6 +145,7 @@ export class AuthService {
       verificationToken: rawVerificationToken,
     };
   }
+
 
   /**
    * Log in user with email & password. Issues access token + refresh token session.
@@ -224,14 +187,13 @@ export class AuthService {
       },
     });
 
-    const sortedMembers = sortOrganizationsPrioritizingAcme(user.organizationMembers);
-    const activeOrgId = sortedMembers[0]?.organizationId;
+    const activeOrgId = user.organizationMembers[0]?.organizationId;
 
     const authData: AuthResponseData = {
       user: formatUserDto(user),
       accessToken,
       activeOrganizationId: activeOrgId,
-      organizations: sortedMembers.map(formatOrgMemberDto),
+      organizations: user.organizationMembers.map(formatOrgMemberDto),
     };
 
     return {
@@ -239,6 +201,7 @@ export class AuthService {
       refreshToken,
     };
   }
+
 
 
   /**
@@ -336,14 +299,13 @@ export class AuthService {
       throw new NotFoundError('User not found');
     }
 
-    const sortedMembers = sortOrganizationsPrioritizingAcme(user.organizationMembers);
-
     return {
       user: formatUserDto(user),
-      activeOrganizationId: sortedMembers[0]?.organizationId,
-      organizations: sortedMembers.map(formatOrgMemberDto),
+      activeOrganizationId: user.organizationMembers[0]?.organizationId,
+      organizations: user.organizationMembers.map(formatOrgMemberDto),
     };
   }
+
 
 
   /**
@@ -460,202 +422,4 @@ export class AuthService {
 
     return { message: 'Verification link sent.', verificationToken: rawToken };
   }
-
-  /**
-   * Development-only recovery mechanism to restore OWNER role for rakesh6651@company.com in Rakesh's Org.
-   */
-  static async devRestoreOwner(): Promise<{ message: string; user: UserDto; activeOrganizationId: string; organizations: OrgMemberDto[] }> {
-    if (process.env['NODE_ENV'] === 'production') {
-      throw new ForbiddenError('Development features are disabled in production environments');
-    }
-
-    const email = 'rakesh6651@company.com';
-    const name = 'Rakesh Rajput';
-    const password = 'Password123!';
-    const passwordHash = await hashPassword(password);
-
-    let user = await prisma.user.findUnique({
-      where: { email },
-    });
-
-    if (!user) {
-      user = await prisma.user.create({
-        data: {
-          email,
-          name,
-          passwordHash,
-          emailVerified: true,
-        },
-      });
-    } else {
-      user = await prisma.user.update({
-        where: { id: user.id },
-        data: { passwordHash, emailVerified: true },
-      });
-    }
-
-    let org = await prisma.organization.findFirst({
-      where: { slug: 'rakesh-org' },
-    });
-
-    if (!org) {
-      org = await prisma.organization.findFirst({
-        where: { name: "Rakesh's Org" },
-      });
-    }
-
-    if (!org) {
-      org = await prisma.organization.create({
-        data: {
-          name: "Rakesh's Org",
-          slug: 'rakesh-org',
-        },
-      });
-    }
-
-    const member = await prisma.organizationMember.findUnique({
-      where: {
-        organizationId_userId: {
-          organizationId: org.id,
-          userId: user.id,
-        },
-      },
-    });
-
-    if (!member) {
-      await prisma.organizationMember.create({
-        data: {
-          organizationId: org.id,
-          userId: user.id,
-          role: OrgRole.OWNER,
-        },
-      });
-    } else {
-      await prisma.organizationMember.update({
-        where: { id: member.id },
-        data: { role: OrgRole.OWNER },
-      });
-    }
-
-    const updatedUser = await prisma.user.findUniqueOrThrow({
-      where: { id: user.id },
-      include: {
-        organizationMembers: {
-          include: { organization: true },
-        },
-      },
-    });
-
-    return {
-      message: 'Owner role successfully restored in development environment',
-      user: formatUserDto(updatedUser),
-      activeOrganizationId: org.id,
-      organizations: updatedUser.organizationMembers.map(formatOrgMemberDto),
-    };
-  }
-
-  /**
-   * Development-only password recovery mechanism for VIEWER user (rakesh5566@company.com).
-   * Ensures user exists, resets password, and guarantees VIEWER role in organization.
-   */
-  static async devResetViewerPassword(): Promise<{ message: string; user: UserDto; activeOrganizationId: string; organizations: OrgMemberDto[] }> {
-    if (process.env['NODE_ENV'] === 'production') {
-      throw new ForbiddenError('Development features are disabled in production environments');
-    }
-
-    const email = 'rakesh5566@company.com';
-    const password = 'Password123!';
-    const passwordHash = await hashPassword(password);
-
-    let user = await prisma.user.findUnique({
-      where: { email },
-    });
-
-    if (!user) {
-      user = await prisma.user.create({
-        data: {
-          email,
-          name: 'Rakesh Viewer',
-          passwordHash,
-          emailVerified: true,
-        },
-      });
-    } else {
-      user = await prisma.user.update({
-        where: { id: user.id },
-        data: { passwordHash, emailVerified: true },
-      });
-    }
-
-    let org = await prisma.organization.findFirst({
-      where: { slug: 'rakesh-org' },
-    });
-
-    if (!org) {
-      org = await prisma.organization.findFirst({
-        where: { name: "Rakesh's Org" },
-      });
-    }
-
-    if (!org) {
-      org = await prisma.organization.create({
-        data: {
-          name: "Rakesh's Org",
-          slug: 'rakesh-org',
-        },
-      });
-    }
-
-    const member = await prisma.organizationMember.findUnique({
-      where: {
-        organizationId_userId: {
-          organizationId: org.id,
-          userId: user.id,
-        },
-      },
-    });
-
-    if (!member) {
-      await prisma.organizationMember.create({
-        data: {
-          organizationId: org.id,
-          userId: user.id,
-          role: OrgRole.VIEWER,
-        },
-      });
-    } else {
-      await prisma.organizationMember.update({
-        where: { id: member.id },
-        data: { role: OrgRole.VIEWER },
-      });
-    }
-
-    const updatedUser = await prisma.user.findUniqueOrThrow({
-      where: { id: user.id },
-      include: {
-        organizationMembers: {
-          include: { organization: true },
-        },
-      },
-    });
-
-    return {
-      message: 'Viewer password successfully reset in development environment',
-      user: formatUserDto(updatedUser),
-      activeOrganizationId: org.id,
-      organizations: updatedUser.organizationMembers.map(formatOrgMemberDto),
-    };
-  }
-
-  static async seedDemoData(): Promise<unknown> {
-    const { runDemoSeeding } = await import('../../utils/seedDemo');
-    return runDemoSeeding(prisma);
-  }
-
-  static async cleanDemoOrgs(): Promise<unknown> {
-    const { cleanupExtraOrganizations } = await import('../../utils/cleanupOrgs');
-    return cleanupExtraOrganizations(prisma);
-  }
 }
-
-

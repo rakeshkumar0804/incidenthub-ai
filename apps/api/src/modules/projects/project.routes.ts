@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { ProjectController } from './project.controller';
 import { authenticate, requireAuth, requireOrgMember } from '../../middleware/auth';
 import { requirePermission } from '../../middleware/rbac';
+import { requireProjectPermission } from '../../middleware/resourceAuth';
 
 const orgProjectsRouter = Router({ mergeParams: true });
 const rootProjectsRouter = Router();
@@ -39,12 +40,16 @@ orgProjectsRouter.post(
 );
 
 // GET /api/v1/projects/:projectId
+
 rootProjectsRouter.get(
   '/:projectId',
   (req, res, next) => {
     void authenticate(req, res, next);
   },
   requireAuth,
+  (req, res, next) => {
+    void requireProjectPermission('projects:read')(req, res, next);
+  },
   (req, res, next) => {
     void ProjectController.getById(req, res, next);
   },
@@ -58,6 +63,9 @@ rootProjectsRouter.patch(
   },
   requireAuth,
   (req, res, next) => {
+    void requireProjectPermission('projects:manage')(req, res, next);
+  },
+  (req, res, next) => {
     void ProjectController.update(req, res, next);
   },
 );
@@ -69,6 +77,9 @@ rootProjectsRouter.delete(
     void authenticate(req, res, next);
   },
   requireAuth,
+  (req, res, next) => {
+    void requireProjectPermission('projects:manage')(req, res, next);
+  },
   (req, res, next) => {
     void ProjectController.delete(req, res, next);
   },

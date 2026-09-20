@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../features/auth/AuthContext';
 import { apiClient } from '../lib/axios';
+import { getSafeInternalPath } from '../utils/navigation';
 import type { ApiSuccess, AuthResponseData } from '@incidenthub/shared';
 
 export function LoginPage() {
@@ -14,7 +15,8 @@ export function LoginPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const from = (location.state as { from?: { pathname?: string } })?.from?.pathname || '/';
+  const rawFrom = (location.state as { from?: { pathname?: string } })?.from?.pathname;
+  const from = getSafeInternalPath(rawFrom, '/');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -29,7 +31,7 @@ export function LoginPage() {
 
       if (data.success) {
         login(data.data);
-        navigate(from, { replace: true });
+        void navigate(from, { replace: true });
       }
     } catch (err: unknown) {
       if (typeof err === 'object' && err !== null && 'response' in err) {

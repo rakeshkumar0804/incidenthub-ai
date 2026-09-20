@@ -244,14 +244,16 @@ describe('Phase 13 — Slack + Jira Integrations Test Suite', () => {
         timestamp: Date.now(),
       };
 
+      const jiraSecret = process.env['JIRA_WEBHOOK_SECRET'] || 'test-jira-webhook-secret-phase1-audit';
+
       const res = await request
         .post('/api/v1/webhooks/jira')
-        .set('x-atlassian-webhook-secret', 'incidenthub-dev-jira-webhook-secret')
+        .set('x-atlassian-webhook-secret', jiraSecret)
         .send(webhookPayload);
 
       expect(res.status).toBe(200);
       const body = res.body as ApiEnvelope<{ status: string }>;
-      expect(body.data.status).toBe('updated');
+      expect(body.data.status).toBe('processed');
 
       const updatedActionItem = await prisma.actionItem.findUnique({ where: { id: actionItemId } });
       expect(updatedActionItem?.status).toBe(ActionItemStatus.COMPLETED);
@@ -259,11 +261,11 @@ describe('Phase 13 — Slack + Jira Integrations Test Suite', () => {
       // Duplicate webhook drop check
       const echoRes = await request
         .post('/api/v1/webhooks/jira')
-        .set('x-atlassian-webhook-secret', 'incidenthub-dev-jira-webhook-secret')
+        .set('x-atlassian-webhook-secret', jiraSecret)
         .send(webhookPayload);
 
       const echoBody = echoRes.body as ApiEnvelope<{ status: string }>;
-      expect(echoBody.data.status).toContain('ignored');
+      expect(echoBody.data.status).toBe('duplicate');
     });
   });
 

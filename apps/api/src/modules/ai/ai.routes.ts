@@ -1,15 +1,12 @@
 import { Router } from 'express';
-import { authenticate, requireOrgMember } from '../../middleware/auth';
-import { requirePermission } from '../../middleware/rbac';
+import { authenticate } from '../../middleware/auth';
+import { requireOrgIncidentPermission } from '../../middleware/resourceAuth';
 import { AIController } from './ai.controller';
 
 const router = Router({ mergeParams: true });
 
 router.use((req, res, next) => {
   void authenticate(req, res, next);
-});
-router.use((req, res, next) => {
-  void requireOrgMember(req, res, next);
 });
 
 /**
@@ -18,7 +15,9 @@ router.use((req, res, next) => {
  */
 router.post(
   '/',
-  requirePermission('incidents:update'),
+  (req, res, next) => {
+    void requireOrgIncidentPermission('incidents:update')(req, res, next);
+  },
   (req, res, next) => {
     void AIController.triggerInvestigation(req, res, next);
   },
@@ -30,7 +29,9 @@ router.post(
  */
 router.get(
   '/',
-  requirePermission('incidents:read'),
+  (req, res, next) => {
+    void requireOrgIncidentPermission('incidents:read')(req, res, next);
+  },
   (req, res, next) => {
     void AIController.getLatestInvestigation(req, res, next);
   },
@@ -42,7 +43,9 @@ router.get(
  */
 router.get(
   '/runs',
-  requirePermission('incidents:read'),
+  (req, res, next) => {
+    void requireOrgIncidentPermission('incidents:read')(req, res, next);
+  },
   (req, res, next) => {
     void AIController.getInvestigationRuns(req, res, next);
   },

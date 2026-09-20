@@ -33,7 +33,7 @@ export function ResetPasswordPage() {
       });
 
       if (data.success) {
-        navigate('/login', { state: { message: 'Password reset successfully. Please log in.' } });
+        void navigate('/login', { state: { message: 'Password reset successfully. Please log in.' } });
       }
     } catch (err: unknown) {
       if (typeof err === 'object' && err !== null && 'response' in err) {

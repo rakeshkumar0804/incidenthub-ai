@@ -48,26 +48,21 @@ router.use('/incidents', rootIncidentsRouter);
 
 // Comments (Phase 5)
 router.use('/organizations/:organizationId/incidents/:incidentId/comments', commentsRouter);
-router.use('/incidents/:incidentId/comments', commentsRouter);
 
 // Analytics + Engineering Intelligence (Phase 12)
 router.use('/organizations/:organizationId/analytics', analyticsRouter);
 
 // Correlation Engine (Phase 8)
 router.use('/organizations/:organizationId/incidents/:incidentId/correlation', correlationRouter);
-router.use('/incidents/:incidentId/correlation', correlationRouter);
 
 // AI Investigation Engine (Phase 9)
 router.use('/organizations/:organizationId/incidents/:incidentId/investigation', aiRouter);
-router.use('/incidents/:incidentId/investigation', aiRouter);
 
 // Incident Replay Engine (Phase 10)
 router.use('/organizations/:organizationId/incidents/:incidentId/replay', replayRouter);
-router.use('/incidents/:incidentId/replay', replayRouter);
 
 // AI Postmortem Engine (Phase 11)
 router.use('/organizations/:organizationId/incidents/:incidentId/postmortem', postmortemRouter);
-router.use('/incidents/:incidentId/postmortem', postmortemRouter);
 
 // GitHub Integration (Phase 6)
 router.use('/organizations/:organizationId/integrations/github', orgGithubRouter);

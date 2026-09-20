@@ -81,7 +81,7 @@ export class ServiceService {
 
     const services = await prisma.service.findMany({
       where: { projectId },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
     });
 
     return services.map((s) => ({

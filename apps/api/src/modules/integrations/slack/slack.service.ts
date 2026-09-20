@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../../../lib/prisma';
 import { encryptText, decryptText } from '../../../utils/crypto';
-import { NotFoundError, ValidationError, AppError } from '../../../utils/errors';
+import { NotFoundError, ValidationError, AppError, classifyPrismaUniqueError } from '../../../utils/errors';
 import { logger } from '../../../utils/logger';
 import { env } from '../../../config/env';
 import {
@@ -259,7 +259,7 @@ export class SlackService {
       return null;
     }
 
-    const incident = await prisma.incident.findUnique({ where: { id: incidentId } });
+    const incident = await prisma.incident.findFirst({ where: { id: incidentId, organizationId } });
     if (!incident) throw new NotFoundError('Incident not found');
 
     const titleSlug = incident.title.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 20);
@@ -331,15 +331,33 @@ export class SlackService {
       return false;
     }
 
-    const signingSecret = process.env['SLACK_SIGNING_SECRET'] || 'incidenthub-dev-slack-signing-secret';
+    const signingSecret = process.env['SLACK_SIGNING_SECRET'];
+    if (!signingSecret) {
+      return false;
+    }
+
     const sigBasestring = `v0:${timestamp}:${typeof rawBody === 'string' ? rawBody : rawBody.toString('utf8')}`;
 
     const hmac = crypto.createHmac('sha256', signingSecret).update(sigBasestring).digest('hex');
     const mySignature = `v0=${hmac}`;
 
-    return crypto.timingSafeEqual(Buffer.from(mySignature, 'utf8'), Buffer.from(signature, 'utf8'));
+    const sigBuf = Buffer.from(signature, 'utf8');
+    const mySigBuf = Buffer.from(mySignature, 'utf8');
+
+    if (sigBuf.length !== mySigBuf.length) {
+      return false;
+    }
+
+    try {
+      return crypto.timingSafeEqual(mySigBuf, sigBuf);
+    } catch {
+      return false;
+    }
   }
 
+  /**
+   * Handles interactive Slack message button actions (Ack, Mitigate, Resolve).
+   */
   /**
    * Handles interactive Slack message button actions (Ack, Mitigate, Resolve).
    */
@@ -350,9 +368,36 @@ export class SlackService {
     const actionId = action.action_id;
     const incidentId = action.value;
 
-    // Resolve target Organization & User by teamId
+    // 1. Stable Delivery Identity (Objective 1)
+    const rawPayloadObj = payload as unknown as Record<string, unknown>;
+    const deliveryId =
+      payload.trigger_id ||
+      (typeof rawPayloadObj['action_ts'] === 'string' ? rawPayloadObj['action_ts'] : undefined) ||
+      (typeof (rawPayloadObj['container'] as Record<string, unknown> | undefined)?.['message_ts'] === 'string'
+        ? ((rawPayloadObj['container'] as Record<string, unknown>)['message_ts'] as string)
+        : undefined) ||
+      `slack-${crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex')}`;
+
+    // 2. Early Idempotency Check
+    const existingEvent = await prisma.externalEvent.findUnique({
+      where: { provider_externalId: { provider: 'slack', externalId: deliveryId } },
+    });
+    if (existingEvent && existingEvent.processedAt !== null) {
+      return { text: 'ℹ️ Action already processed.' };
+    }
+
+    const incident = await prisma.incident.findUnique({
+      where: { id: incidentId },
+    });
+
+    if (!incident) {
+      return { text: '❌ Incident not found or access denied.' };
+    }
+
+    // Resolve Slack integration for this incident's organization
     const integration = await prisma.integration.findFirst({
       where: {
+        organizationId: incident.organizationId,
         provider: IntegrationProvider.SLACK,
         status: IntegrationStatus.CONNECTED,
       },
@@ -360,14 +405,6 @@ export class SlackService {
 
     if (!integration) {
       return { text: '⚠️ Slack integration is disconnected or inactive.' };
-    }
-
-    const incident = await prisma.incident.findUnique({
-      where: { id: incidentId },
-    });
-
-    if (!incident || incident.organizationId !== integration.organizationId) {
-      return { text: '❌ Incident not found or access denied.' };
     }
 
     // Resolve or map user to OrganizationMember
@@ -379,42 +416,74 @@ export class SlackService {
       return { text: '⛔ Permission denied: Slack user is not linked to an authorized IncidentHub member.' };
     }
 
-    // Process action under IncidentHub status lifecycle rules
+    // 3. Process action under IncidentHub status lifecycle rules & record ExternalEvent
     const { IncidentService } = await import('../../incidents/incident.service');
 
     try {
+      const evt = await prisma.externalEvent.upsert({
+        where: { provider_externalId: { provider: 'slack', externalId: deliveryId } },
+        create: {
+          organizationId: incident.organizationId,
+          integrationId: integration.id,
+          provider: 'slack',
+          externalId: deliveryId,
+          eventType: 'slack:interactive_action',
+          payload: payload as unknown as Prisma.InputJsonValue,
+          occurredAt: new Date(),
+          processedAt: null,
+        },
+        update: {
+          organizationId: incident.organizationId,
+          integrationId: integration.id,
+          eventType: 'slack:interactive_action',
+          payload: payload as unknown as Prisma.InputJsonValue,
+        },
+      });
+
+      let responseText = '';
+
       if (actionId === 'ack_incident') {
         if (String(incident.status) !== String(IncidentStatus.OPEN)) {
-          return { text: `ℹ️ Incident INC-${incident.number} is already in status ${incident.status}.` };
+          responseText = `ℹ️ Incident INC-${incident.number} is already in status ${incident.status}.`;
+        } else {
+          await IncidentService.updateStatus(incident.organizationId, incident.id, member.userId, {
+            status: IncidentStatus.INVESTIGATING,
+          });
+          responseText = `✅ Incident INC-${incident.number} state updated to INVESTIGATING.`;
         }
-        await IncidentService.updateStatus(incident.organizationId, incident.id, member.userId, {
-          status: IncidentStatus.INVESTIGATING,
-        });
-        return { text: `✅ Incident INC-${incident.number} state updated to INVESTIGATING.` };
-      }
-
-      if (actionId === 'mitigate_incident') {
+      } else if (actionId === 'mitigate_incident') {
         if (String(incident.status) === String(IncidentStatus.RESOLVED)) {
-          return { text: `ℹ️ Incident INC-${incident.number} is already RESOLVED.` };
+          responseText = `ℹ️ Incident INC-${incident.number} is already RESOLVED.`;
+        } else {
+          await IncidentService.updateStatus(incident.organizationId, incident.id, member.userId, {
+            status: IncidentStatus.MITIGATING,
+          });
+          responseText = `✅ Incident INC-${incident.number} state updated to MITIGATING.`;
         }
-        await IncidentService.updateStatus(incident.organizationId, incident.id, member.userId, {
-          status: IncidentStatus.MITIGATING,
-        });
-        return { text: `✅ Incident INC-${incident.number} state updated to MITIGATING.` };
-      }
-
-      if (actionId === 'resolve_incident') {
+      } else if (actionId === 'resolve_incident') {
         if (String(incident.status) === String(IncidentStatus.RESOLVED)) {
-          return { text: `ℹ️ Incident INC-${incident.number} is already RESOLVED.` };
+          responseText = `ℹ️ Incident INC-${incident.number} is already RESOLVED.`;
+        } else {
+          await IncidentService.updateStatus(incident.organizationId, incident.id, member.userId, {
+            status: IncidentStatus.RESOLVED,
+          });
+          responseText = `✅ Incident INC-${incident.number} has been RESOLVED.`;
         }
-        await IncidentService.updateStatus(incident.organizationId, incident.id, member.userId, {
-          status: IncidentStatus.RESOLVED,
-        });
-        return { text: `✅ Incident INC-${incident.number} has been RESOLVED.` };
+      } else {
+        responseText = `Unknown action: ${actionId}`;
       }
 
-      return { text: `Unknown action: ${actionId}` };
+      await prisma.externalEvent.update({
+        where: { id: evt.id },
+        data: { processedAt: new Date() },
+      });
+
+      return { text: responseText };
     } catch (err: unknown) {
+      const classification = classifyPrismaUniqueError(err);
+      if (classification === 'EXTERNAL_EVENT_DUPLICATE') {
+        return { text: 'ℹ️ Action already processed.' };
+      }
       const errMsg = err instanceof Error ? err.message : 'State transition failed';
       return { text: `⚠️ Transition rejected: ${errMsg}` };
     }

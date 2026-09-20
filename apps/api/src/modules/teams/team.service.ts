@@ -35,7 +35,7 @@ export class TeamService {
       include: {
         _count: { select: { members: true, projects: true } },
       },
-      orderBy: { name: 'asc' },
+      orderBy: [{ name: 'asc' }, { id: 'asc' }],
     });
 
     return teams.map((t) => ({

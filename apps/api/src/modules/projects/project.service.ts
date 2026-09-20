@@ -65,7 +65,7 @@ export class ProjectService {
         team: { select: { id: true, name: true } },
         _count: { select: { services: true } },
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
     });
 
     return projects.map((p) => ({
@@ -89,7 +89,7 @@ export class ProjectService {
       include: {
         team: { select: { id: true, name: true } },
         services: {
-          orderBy: { createdAt: 'desc' },
+          orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
         },
       },
     });

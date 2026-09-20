@@ -23,7 +23,7 @@ export function ForgotPasswordPage() {
 
       if (data.success) {
         let msg = data.data.message;
-        if (data.data.resetToken) {
+        if (import.meta.env.DEV && data.data.resetToken) {
           msg += ` (Dev token: ${data.data.resetToken})`;
         }
         setSuccessMessage(msg);

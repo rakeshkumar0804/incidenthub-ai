@@ -1,27 +1,37 @@
 import React, { useState, useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { PostmortemStatus, ActionItemPriority, ActionItemStatus } from '@incidenthub/shared';
-import type { PostmortemDto, PostmortemVersionDto } from '@incidenthub/shared';
+import { PostmortemStatus, ActionItemPriority, ActionItemStatus, OrgRole } from '@incidenthub/shared';
+import type { PostmortemDto, PostmortemVersionDto, PostmortemRunDto, LatestPostmortemFailureDto } from '@incidenthub/shared';
 import { postmortemService } from '../../../services/postmortemService';
+import { useAuth } from '../../auth/AuthContext';
 
 interface PostmortemSectionProps {
   organizationId: string;
   incidentId: string;
+  incidentStatus?: string;
   isViewer?: boolean;
 }
 
 export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
   organizationId,
   incidentId,
+  incidentStatus,
   isViewer = false,
 }) => {
   const queryClient = useQueryClient();
+  const { activeOrg } = useAuth();
+  const userRole = activeOrg?.role;
+  const isOwnerOrAdmin = userRole === OrgRole.OWNER || userRole === OrgRole.ADMIN;
+
   const [postmortemData, setPostmortemData] = useState<PostmortemDto | null>(null);
   const [activeVersion, setActiveVersion] = useState<PostmortemVersionDto | null>(null);
   const [selectedVersionId, setSelectedVersionId] = useState<string>('');
+  const [latestRun, setLatestRun] = useState<PostmortemRunDto | null>(null);
+  const [latestFailure, setLatestFailure] = useState<LatestPostmortemFailureDto | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [isEditing, setIsEditing] = useState<boolean>(false);
+  const [showPublishConfirm, setShowPublishConfirm] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Form states for editing
@@ -29,9 +39,11 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
   const [impact, setImpact] = useState<string>('');
   const [rootCause, setRootCause] = useState<string>('');
   const [contributingFactors, setContributingFactors] = useState<string>('');
+  const [detection, setDetection] = useState<string>('');
   const [resolution, setResolution] = useState<string>('');
   const [wentWell, setWentWell] = useState<string>('');
   const [wentWrong, setWentWrong] = useState<string>('');
+  const [uncertainty, setUncertainty] = useState<string>('');
 
   // Action item modal state
   const [actionTitle, setActionTitle] = useState<string>('');
@@ -44,6 +56,8 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
       setErrorMsg(null);
       const data = await postmortemService.getPostmortem(organizationId, incidentId);
       setPostmortemData(data.postmortem);
+      setLatestRun(data.latestRun || null);
+      setLatestFailure(data.latestFailure || null);
 
       if (data.postmortem?.activeVersion) {
         setActiveVersion(data.postmortem.activeVersion);
@@ -63,9 +77,11 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
     setImpact(ver.impact || '');
     setRootCause(ver.rootCause || '');
     setContributingFactors(ver.contributingFactors || '');
+    setDetection(ver.detection || '');
     setResolution(ver.resolution || '');
     setWentWell(ver.wentWell || '');
     setWentWrong(ver.wentWrong || '');
+    setUncertainty(ver.uncertainty || '');
   };
 
   useEffect(() => {
@@ -86,9 +102,13 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
     try {
       setIsGenerating(true);
       setErrorMsg(null);
-      await postmortemService.generatePostmortem(organizationId, incidentId, 'MANUAL_REQUEST');
-      await fetchPostmortem();
-      void queryClient.invalidateQueries({ queryKey: ['timeline', incidentId] });
+      const result = await postmortemService.generatePostmortem(organizationId, incidentId, 'MANUAL_REQUEST');
+      if (result.status === 'skipped_lock_active') {
+        setErrorMsg('Postmortem generation is already in progress in another session.');
+      } else {
+        await fetchPostmortem();
+        void queryClient.invalidateQueries({ queryKey: ['timeline', incidentId] });
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Postmortem generation failed';
       setErrorMsg(msg);
@@ -98,22 +118,51 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
   };
 
   const handleSaveEdit = async () => {
+    if (!activeVersion?.id) {
+      setErrorMsg('No active postmortem version selected');
+      return;
+    }
     try {
       setIsLoading(true);
       setErrorMsg(null);
       await postmortemService.updatePostmortem(organizationId, incidentId, {
+        baseVersionId: activeVersion.id,
         summary,
         impact,
         rootCause,
         contributingFactors,
+        detection,
         resolution,
         wentWell,
         wentWrong,
+        uncertainty: uncertainty || undefined,
       });
       setIsEditing(false);
       await fetchPostmortem();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to save postmortem edits';
+      setErrorMsg(msg);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleTransitionStatus = async (targetStatus: PostmortemStatus) => {
+    if (!activeVersion?.id) {
+      setErrorMsg('No active postmortem version selected');
+      return;
+    }
+    try {
+      setIsLoading(true);
+      setErrorMsg(null);
+      await postmortemService.updatePostmortem(organizationId, incidentId, {
+        baseVersionId: activeVersion.id,
+        status: targetStatus,
+      });
+      setShowPublishConfirm(false);
+      await fetchPostmortem();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : `Failed to update status to ${targetStatus}`;
       setErrorMsg(msg);
     } finally {
       setIsLoading(false);
@@ -138,7 +187,8 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
   };
 
   const handleActionItemStatusToggle = async (actionItemId: string, currentStatus: ActionItemStatus) => {
-    const nextStatus: ActionItemStatus = currentStatus === ActionItemStatus.COMPLETED ? ActionItemStatus.OPEN : ActionItemStatus.COMPLETED;
+    const nextStatus: ActionItemStatus =
+      currentStatus === ActionItemStatus.COMPLETED ? ActionItemStatus.OPEN : ActionItemStatus.COMPLETED;
     try {
       setErrorMsg(null);
       await postmortemService.updateActionItem(organizationId, incidentId, actionItemId, {
@@ -175,7 +225,12 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
         <div className="flex items-center gap-3">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-violet-600/20 border border-violet-500/30 text-violet-400">
             <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+              />
             </svg>
           </div>
           <div>
@@ -186,10 +241,22 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
                   {activeVersion.status} (v{activeVersion.versionNumber})
                 </span>
               )}
+              {activeVersion?.status === PostmortemStatus.DRAFT && activeVersion.aiGenerated && (
+                <span className="rounded-full bg-violet-500/20 border border-violet-500/40 px-2 py-0.5 text-[10px] font-bold text-violet-300">
+                  AI-Generated Draft
+                </span>
+              )}
             </div>
-            <p className="text-xs text-gray-400">
-              Evidence-grounded postmortem versioning with human review &amp; action item extraction.
-            </p>
+            <div className="flex items-center gap-2">
+              <p className="text-xs text-gray-400">
+                Evidence-grounded postmortem versioning with human review &amp; action item extraction.
+              </p>
+              {latestRun && latestRun.status === 'COMPLETED' && (
+                <span className="text-[10px] text-gray-500 font-mono">
+                  · {latestRun.providerName} ({latestRun.latencyMs}ms)
+                </span>
+              )}
+            </div>
           </div>
         </div>
 
@@ -224,10 +291,17 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
               ) : (
                 <>
                   <svg className="h-4 w-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L5.601 15.1a2 2 0 00-1.022.547l-1.002 1.002a2 2 0 00-.547 1.022l-.477 2.387a2 2 0 002.387 2.387l2.387-.477a2 2 0 001.022-.547l1.002-1.002a2 2 0 00.547-1.022l.477-2.387a6 6 0 00-.517-3.86l-.158-.318a6 6 0 01-.517-3.86l.477-2.387a2 2 0 00-.547-1.022L12.387 2.1a2 2 0 00-2.387 2.387l.477 2.387a2 2 0 00.547 1.022l1.002 1.002a2 2 0 001.022.547l2.387.477a6 6 0 003.86-.517l.318-.158a6 6 0 013.86-.517l2.387.477a2 2 0 001.022.547l1.002 1.002z" />
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L5.601 15.1a2 2 0 00-1.022.547l-1.002 1.002a2 2 0 00-.547 1.022l-.477 2.387a2 2 0 002.387 2.387l2.387-.477a2 2 0 001.022-.547l1.002-1.002a2 2 0 00.547-1.022l.477-2.387a6 6 0 00-.517-3.86l-.158-.318a6 6 0 01-.517-3.86l.477-2.387a2 2 0 00-.547-1.022L12.387 2.1a2 2 0 00-2.387 2.387l.477 2.387a2 2 0 00.547 1.022l1.002 1.002a2 2 0 001.022.547l2.387.477a6 6 0 003.86-.517l.318-.158a6 6 0 013.86-.517l2.387.477a2 2 0 001.022.547l1.002 1.002z"
+                    />
                   </svg>
                   <span>
-                    {versions.length > 0 ? `Re-Generate v${activeVersion ? activeVersion.versionNumber + 1 : 'Next'}` : 'Generate Postmortem'}
+                    {versions.length > 0
+                      ? `Re-Generate v${activeVersion ? activeVersion.versionNumber + 1 : 'Next'}`
+                      : 'Generate Postmortem'}
                   </span>
                 </>
               )}
@@ -236,13 +310,23 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
         </div>
       </div>
 
-      {/* Error Alert Banner */}
+      {/* Error / Lock Contention Banner */}
       {errorMsg && (
         <div className="mb-4 flex items-center justify-between rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-400">
           <span>Postmortem error: {errorMsg}</span>
           <button type="button" onClick={() => setErrorMsg(null)} className="ml-2 font-bold text-red-400 hover:text-white">
             ✕
           </button>
+        </div>
+      )}
+
+      {/* Latest Run Failure Banner (preserving last completed document) */}
+      {latestFailure && !errorMsg && (
+        <div className="mb-4 flex items-center justify-between rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-300">
+          <span>
+            Last generation attempt failed ({latestFailure.error}). Showing latest completed version v
+            {activeVersion?.versionNumber || 1}.
+          </span>
         </div>
       )}
 
@@ -258,23 +342,108 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
         </div>
       ) : (
         <div className="space-y-6">
-          {/* Postmortem Document View/Edit Mode */}
-          <div className="flex items-center justify-between border-b border-white/5 pb-3">
-            <h3 className="text-xs font-semibold uppercase tracking-wider text-violet-400">
-              Version {activeVersion.versionNumber} Document
-            </h3>
+          {/* Workflow Action Bar */}
+          {!isViewer && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/5 bg-white/[0.02] p-3">
+              <div className="flex items-center gap-2 text-xs text-gray-400">
+                <span>Workflow State:</span>
+                <span className={`font-semibold ${getStatusBadgeClass(activeVersion.status)}`}>{activeVersion.status}</span>
+                {activeVersion.approvedById && (
+                  <span className="text-gray-500">· Approved</span>
+                )}
+                {activeVersion.publishedAt && (
+                  <span className="text-emerald-400">
+                    · Published on {new Date(activeVersion.publishedAt).toLocaleDateString()}
+                  </span>
+                )}
+              </div>
 
-            {!isViewer && (
-              <button
-                type="button"
-                onClick={() => setIsEditing(!isEditing)}
-                className="text-xs font-medium text-violet-400 hover:text-violet-300 transition"
-              >
-                {isEditing ? 'Cancel Edit' : 'Edit Document'}
-              </button>
-            )}
-          </div>
+              <div className="flex items-center gap-2">
+                {activeVersion.status === PostmortemStatus.DRAFT && (
+                  <button
+                    type="button"
+                    onClick={() => void handleTransitionStatus(PostmortemStatus.IN_REVIEW)}
+                    className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-500"
+                  >
+                    Submit for Review
+                  </button>
+                )}
 
+                {activeVersion.status === PostmortemStatus.IN_REVIEW && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => void handleTransitionStatus(PostmortemStatus.DRAFT)}
+                      className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-gray-300 hover:bg-white/10"
+                    >
+                      Request Changes
+                    </button>
+                    {isOwnerOrAdmin && (
+                      <button
+                        type="button"
+                        onClick={() => void handleTransitionStatus(PostmortemStatus.APPROVED)}
+                        className="rounded-lg bg-purple-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-purple-500"
+                      >
+                        Approve Postmortem
+                      </button>
+                    )}
+                  </>
+                )}
+
+                {activeVersion.status === PostmortemStatus.APPROVED && isOwnerOrAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => setShowPublishConfirm(true)}
+                    className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+                  >
+                    Publish Postmortem
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => setIsEditing(!isEditing)}
+                  className="rounded-lg border border-violet-500/30 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-300 hover:bg-violet-500/20"
+                >
+                  {isEditing ? 'Cancel Edit' : 'Edit Document (New Version)'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Publish Confirmation Modal */}
+          {showPublishConfirm && (
+            <div className="rounded-xl border border-emerald-500/30 bg-emerald-950/40 p-4 space-y-3">
+              <h4 className="text-xs font-bold text-emerald-300 uppercase tracking-wider">Confirm Postmortem Publication</h4>
+              <p className="text-xs text-gray-300 leading-relaxed">
+                Publishing locks this postmortem version and makes it visible across the organization. The incident must be
+                marked <strong>RESOLVED</strong>.
+              </p>
+              {incidentStatus && incidentStatus !== 'RESOLVED' && (
+                <p className="text-xs text-amber-400 font-semibold">
+                  ⚠️ Incident status is currently &quot;{incidentStatus}&quot;. Incident must be RESOLVED before publishing.
+                </p>
+              )}
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowPublishConfirm(false)}
+                  className="rounded-lg px-3 py-1 text-xs text-gray-400 hover:text-white"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleTransitionStatus(PostmortemStatus.PUBLISHED)}
+                  className="rounded-lg bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500"
+                >
+                  Confirm &amp; Publish
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Edit Form or Document Display */}
           {isEditing ? (
             <div className="space-y-4">
               <div>
@@ -310,6 +479,27 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
 
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                 <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1">Contributing Factors</label>
+                  <textarea
+                    value={contributingFactors}
+                    onChange={(e) => setContributingFactors(e.target.value)}
+                    className="w-full rounded-xl border border-white/10 bg-gray-900 p-3 text-xs text-gray-100 focus:outline-none focus:border-violet-500"
+                    rows={2}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1">Detection Method</label>
+                  <textarea
+                    value={detection}
+                    onChange={(e) => setDetection(e.target.value)}
+                    className="w-full rounded-xl border border-white/10 bg-gray-900 p-3 text-xs text-gray-100 focus:outline-none focus:border-violet-500"
+                    rows={2}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <div>
                   <label className="block text-xs font-medium text-gray-400 mb-1">What Went Well</label>
                   <textarea
                     value={wentWell}
@@ -339,6 +529,16 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
                 />
               </div>
 
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1">Uncertainty &amp; Telemetry Gaps</label>
+                <textarea
+                  value={uncertainty}
+                  onChange={(e) => setUncertainty(e.target.value)}
+                  className="w-full rounded-xl border border-white/10 bg-gray-900 p-3 text-xs text-gray-100 focus:outline-none focus:border-violet-500"
+                  rows={2}
+                />
+              </div>
+
               <div className="flex justify-end gap-2">
                 <button
                   type="button"
@@ -352,7 +552,7 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
                   onClick={() => void handleSaveEdit()}
                   className="rounded-xl bg-violet-600 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-violet-500/20 hover:bg-violet-500"
                 >
-                  Save New Version
+                  Save New Version (v{activeVersion.versionNumber + 1})
                 </button>
               </div>
             </div>
@@ -377,7 +577,7 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
                   <p className="text-xs text-gray-300 leading-relaxed">{activeVersion.impact || 'N/A'}</p>
                 </div>
                 <div className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
-                  <h4 className="mb-1 text-xs font-semibold uppercase tracking-wider text-gray-400">Resolution &amp; Prevention</h4>
+                  <h4 className="mb-1 text-xs font-semibold uppercase tracking-wider text-gray-400">Resolution &amp; Remediation</h4>
                   <p className="text-xs text-gray-300 leading-relaxed">{activeVersion.resolution || 'N/A'}</p>
                 </div>
               </div>
@@ -394,13 +594,31 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
                 </div>
               </div>
 
+              {/* Uncertainty Section (Prominently Displayed) */}
+              {activeVersion.uncertainty && (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="text-amber-400">⚠️</span>
+                    <h4 className="text-xs font-semibold uppercase tracking-wider text-amber-300">
+                      Uncertainty &amp; Telemetry Limitations
+                    </h4>
+                  </div>
+                  <p className="text-xs text-amber-200/90 leading-relaxed">{activeVersion.uncertainty}</p>
+                </div>
+              )}
+
               {/* Evidence Citations */}
               {Array.isArray(activeVersion.evidenceReferences) && activeVersion.evidenceReferences.length > 0 && (
                 <div className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
-                  <h4 className="mb-3 text-xs font-semibold uppercase tracking-wider text-violet-400">Evidence Citations ({activeVersion.evidenceReferences.length})</h4>
+                  <h4 className="mb-3 text-xs font-semibold uppercase tracking-wider text-violet-400">
+                    Evidence Citations ({activeVersion.evidenceReferences.length})
+                  </h4>
                   <div className="space-y-2">
                     {activeVersion.evidenceReferences.map((ref, idx) => (
-                      <div key={idx} className="flex items-start justify-between gap-3 rounded-lg border border-white/5 bg-white/[0.03] p-2.5 text-xs">
+                      <div
+                        key={idx}
+                        className="flex items-start justify-between gap-3 rounded-lg border border-white/5 bg-white/[0.03] p-2.5 text-xs"
+                      >
                         <div>
                           <span className="rounded bg-violet-500/20 px-2 py-0.5 text-[10px] font-bold text-violet-300 uppercase mr-2">
                             {ref.claimType}
@@ -447,6 +665,7 @@ export const PostmortemSection: React.FC<PostmortemSectionProps> = ({
                         onChange={(e) => setActionPriority(e.target.value as ActionItemPriority)}
                         className="rounded-lg border border-white/10 bg-gray-900 px-3 py-1.5 text-xs text-white"
                       >
+                        <option value={ActionItemPriority.CRITICAL}>CRITICAL Priority</option>
                         <option value={ActionItemPriority.HIGH}>HIGH Priority</option>
                         <option value={ActionItemPriority.MEDIUM}>MEDIUM Priority</option>
                         <option value={ActionItemPriority.LOW}>LOW Priority</option>

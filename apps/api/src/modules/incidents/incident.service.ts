@@ -1,5 +1,5 @@
 import { prisma } from '../../lib/prisma';
-import { NotFoundError, ValidationError } from '../../utils/errors';
+import { NotFoundError, ValidationError, ConflictError } from '../../utils/errors';
 import {
   IncidentStatus,
   IncidentSeverity,
@@ -373,9 +373,10 @@ export class IncidentService {
     const skip = (query.page - 1) * query.pageSize;
     const take = query.pageSize;
 
-    const orderBy: Prisma.IncidentOrderByWithRelationInput = {
-      [query.sortBy]: query.sortOrder,
-    };
+    const orderBy: Prisma.IncidentOrderByWithRelationInput[] = [
+      { [query.sortBy]: query.sortOrder },
+      { id: 'asc' },
+    ];
 
     const [totalItems, items] = await Promise.all([
       prisma.incident.count({ where }),
@@ -489,55 +490,64 @@ export class IncidentService {
     userId: string,
     input: UpdateStatusInput,
   ): Promise<IncidentDto> {
-    const incident = await prisma.incident.findUnique({
-      where: { id: incidentId },
-    });
-
-    if (!incident || incident.organizationId !== organizationId) {
-      throw new NotFoundError('Incident not found');
-    }
-
-    const currentStatus = incident.status as IncidentStatus;
     const newStatus = input.status;
 
-    // Validate lifecycle transition
-    IncidentService.validateStatusTransition(currentStatus, newStatus);
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Fetch fresh incident state with organization scope
+      const current = await tx.incident.findFirst({
+        where: { id: incidentId, organizationId },
+      });
 
-    if (currentStatus === newStatus) {
-      return IncidentService.toDto(await prisma.incident.findUniqueOrThrow({
-        where: { id: incidentId },
-        include: { createdBy: true, assignee: true, project: true, service: true },
-      }));
-    }
+      if (!current) {
+        throw new NotFoundError('Incident not found');
+      }
 
-    const updated = await prisma.$transaction(async (tx) => {
-      const data: Prisma.IncidentUpdateInput = {
+      const currentStatus = current.status as IncidentStatus;
+
+      // Idempotent same-status check — return existing state without creating timeline events
+      if (currentStatus === newStatus) {
+        const full = await tx.incident.findUniqueOrThrow({
+          where: { id: incidentId },
+          include: { createdBy: true, assignee: true, project: true, service: true },
+        });
+        return { incident: full, isNoop: true, previousStatus: currentStatus };
+      }
+
+      // Validate lifecycle transition (throws ValidationError / 400 if invalid)
+      IncidentService.validateStatusTransition(currentStatus, newStatus);
+
+      // Auto-maintain timestamps
+      const updateData: Prisma.IncidentUncheckedUpdateInput = {
         status: newStatus,
       };
 
-      // Auto-maintain timestamps
       if (
         (newStatus === IncidentStatus.INVESTIGATING || newStatus === IncidentStatus.MITIGATING) &&
-        !incident.acknowledgedAt
+        !current.acknowledgedAt
       ) {
-        data.acknowledgedAt = new Date();
+        updateData.acknowledgedAt = new Date();
       }
 
       if (newStatus === IncidentStatus.RESOLVED) {
-        data.resolvedAt = new Date();
+        updateData.resolvedAt = new Date();
       }
 
-      const res = await tx.incident.update({
-        where: { id: incidentId },
-        data,
-        include: {
-          createdBy: true,
-          assignee: true,
-          project: true,
-          service: true,
+      // Atomic conditional update matching expected current status
+      const updateResult = await tx.incident.updateMany({
+        where: {
+          id: incidentId,
+          organizationId,
+          status: currentStatus,
         },
+        data: updateData,
       });
 
+      if (updateResult.count === 0) {
+        // Status was modified concurrently between read and update
+        throw new ConflictError('Incident status was modified by a concurrent operation. Please retry.');
+      }
+
+      // Exactly one timeline event created atomically in the transaction
       await tx.incidentEvent.create({
         data: {
           incidentId,
@@ -553,24 +563,34 @@ export class IncidentService {
         },
       });
 
-      return res;
+      const updated = await tx.incident.findUniqueOrThrow({
+        where: { id: incidentId },
+        include: { createdBy: true, assignee: true, project: true, service: true },
+      });
+
+      return { incident: updated, isNoop: false, previousStatus: currentStatus };
     });
 
-    const dto = IncidentService.toDto(updated);
-    broadcastToIncident(incidentId, SocketEvent.INCIDENT_UPDATED, dto);
-    void invalidateAnalyticsCache(organizationId);
-    void SlackService.sendNotification(
-      organizationId,
-      newStatus === IncidentStatus.RESOLVED ? 'INCIDENT_RESOLVED' : 'STATUS_CHANGED',
-      {
-        id: dto.id,
-        number: dto.number,
-        title: dto.title,
-        severity: dto.severity,
-        status: dto.status,
-        environment: dto.environment,
-      },
-    );
+    const dto = IncidentService.toDto(result.incident);
+
+    // Side effects execute ONLY after successful commit and when not a no-op
+    if (!result.isNoop) {
+      broadcastToIncident(incidentId, SocketEvent.INCIDENT_UPDATED, dto);
+      void invalidateAnalyticsCache(organizationId);
+      void SlackService.sendNotification(
+        organizationId,
+        newStatus === IncidentStatus.RESOLVED ? 'INCIDENT_RESOLVED' : 'STATUS_CHANGED',
+        {
+          id: dto.id,
+          number: dto.number,
+          title: dto.title,
+          severity: dto.severity,
+          status: dto.status,
+          environment: dto.environment,
+        },
+      );
+    }
+
     return dto;
   }
 

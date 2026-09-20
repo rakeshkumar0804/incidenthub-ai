@@ -160,6 +160,18 @@ export enum EvidenceSource {
   MANUAL = 'MANUAL',
 }
 
+export enum EvidenceConfidenceTier {
+  HIGH = 'HIGH',
+  MEDIUM = 'MEDIUM',
+  LOW = 'LOW',
+}
+
+export enum CorrelationRunStatus {
+  RUNNING = 'RUNNING',
+  COMPLETED = 'COMPLETED',
+  FAILED = 'FAILED',
+}
+
 // =============================================================================
 // Postmortem
 // =============================================================================

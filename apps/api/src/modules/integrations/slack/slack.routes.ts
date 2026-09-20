@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { SlackController } from './slack.controller';
 import { authenticate, requireOrgMember } from '../../../middleware/auth';
 import { requirePermission } from '../../../middleware/rbac';
+import { requireOrgIncidentPermission } from '../../../middleware/resourceAuth';
 
 const router = Router({ mergeParams: true });
 
@@ -16,9 +17,15 @@ router.get('/connect', requirePermission('integrations:manage'), SlackController
 router.delete('/disconnect', requirePermission('integrations:manage'), (req, res, next) => {
   void SlackController.disconnect(req, res, next);
 });
-router.post('/incidents/:incidentId/channel', requirePermission('incidents:update'), (req, res, next) => {
-  void SlackController.createChannel(req, res, next);
-});
+router.post(
+  '/incidents/:incidentId/channel',
+  (req, res, next) => {
+    void requireOrgIncidentPermission('incidents:update')(req, res, next);
+  },
+  (req, res, next) => {
+    void SlackController.createChannel(req, res, next);
+  },
+);
 
 export { router as slackRouter };
 
@@ -29,7 +36,7 @@ callbackRouter.get('/callback', (req, res, next) => {
 export { callbackRouter as slackCallbackRouter };
 
 const webhookRouter = Router();
-webhookRouter.post('/slack', (req, res, next) => {
+webhookRouter.post(['/slack', '/slack/actions'], (req, res, next) => {
   void SlackController.handleWebhook(req, res, next);
 });
 export { webhookRouter as slackWebhookRouter };

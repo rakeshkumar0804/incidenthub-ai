@@ -106,7 +106,7 @@ export const CreateIncidentPage: React.FC = () => {
         payload,
       );
 
-      navigate(`/incidents/${res.data.data.id}`);
+      void navigate(`/incidents/${res.data.data.id}`);
     } catch (err: unknown) {
       if (typeof err === 'object' && err !== null && 'response' in err) {
         const resErr = err as { response?: { data?: { error?: { message?: string } } } };

@@ -3,7 +3,10 @@ import type { ApiSuccess, ReplayRunDto, ReplayEventDto, TriggerReplayInput } fro
 
 export interface ReplayResponseData {
   incidentId: string;
-  latestRun: (ReplayRunDto & { events: ReplayEventDto[] }) | null;
+  latestRun: (ReplayRunDto & { events?: ReplayEventDto[] }) | null;
+  latestCompletedRun: (ReplayRunDto & { events: ReplayEventDto[] }) | null;
+  latestFailure: { runId: string; error: string; completedAt: string } | null;
+  isRunning: boolean;
 }
 
 export const replayService = {

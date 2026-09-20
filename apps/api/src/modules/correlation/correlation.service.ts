@@ -8,16 +8,19 @@ import type { Prisma } from '@prisma/client';
 import {
   EvidenceType,
   EvidenceSource,
-  EvidenceConfidenceTier,
   CorrelationRunStatus,
   CorrelationTriggerType,
 } from '@prisma/client';
-import type { CandidateSignal, CandidateScoreResult } from './correlation.types';
+import type { CandidateSignal, IncidentScoringContext } from './correlation.types';
+import { scoreAllCandidates, selectNearestCandidates } from './correlation.engine';
 
 export class CorrelationService {
+  // In-process per-incident lock guard when Redis is disconnected or during concurrency
+  private static inProcessLocks = new Set<string>();
+
   /**
    * Triggers a multi-stage, deterministic correlation run for an incident.
-   * Uses Redis distributed locking to guarantee single execution across multi-instance nodes.
+   * Uses Redis distributed locking with atomic SET NX PX and an in-process fallback guard.
    */
   public static async runCorrelation(
     organizationId: string,
@@ -35,10 +38,17 @@ export class CorrelationService {
       throw new NotFoundError('Incident not found in organization');
     }
 
-    // 2. Acquire Redis Distributed Concurrency Lock (30s TTL)
+    // 2. Acquire Concurrency Lock (Atomic Redis SET NX PX + In-Process Guard)
     const lockKey = `lock:correlation:${incidentId}`;
     const lockVal = crypto.randomUUID();
-    let lockAcquired = true;
+    let lockAcquired = false;
+    let redisLockAcquired = false;
+
+    // Check in-process lock first
+    if (CorrelationService.inProcessLocks.has(incidentId)) {
+      logger.info({ incidentId }, 'Correlation run already in progress (in-process lock active)');
+      return { runId: 'none', status: 'skipped_lock_active', correlatedCount: 0 };
+    }
 
     try {
       if (redis.status !== 'ready' && redis.status !== 'connecting') {
@@ -49,21 +59,28 @@ export class CorrelationService {
       }
 
       if (redis.status === 'ready') {
-        const existingLock = await redis.get(lockKey);
-        if (existingLock) {
-          lockAcquired = false;
+        const setRes = await redis.set(lockKey, lockVal, 'PX', 30000, 'NX');
+        if (setRes === 'OK') {
+          lockAcquired = true;
+          redisLockAcquired = true;
         } else {
-          await redis.set(lockKey, lockVal, 'PX', 30000, 'NX');
+          lockAcquired = false;
         }
+      } else {
+        // Fallback: Redis unavailable, rely on in-process per-incident guard
+        lockAcquired = true;
       }
     } catch {
-      // Fallback: If Redis is unavailable, allow execution to proceed under DB safety net
+      // Fallback on Redis error
+      lockAcquired = true;
     }
 
     if (!lockAcquired) {
       logger.info({ incidentId }, 'Correlation run already in progress (Redis lock active)');
-      return { runId: 'none', status: 'skipped: lock active', correlatedCount: 0 };
+      return { runId: 'none', status: 'skipped_lock_active', correlatedCount: 0 };
     }
+
+    CorrelationService.inProcessLocks.add(incidentId);
 
     let correlationRunId = '';
 
@@ -94,474 +111,452 @@ export class CorrelationService {
       });
 
       // =========================================================================
-      // STAGE 1: Candidate Ingestion with Bounded Queries & Truncation Detection
+      // STAGE 1: Candidate Ingestion with Bidirectional Bounded Queries & Truncation Detection
       // =========================================================================
       let isTruncated = false;
-      const candidates: CandidateSignal[] = [];
+      const allCandidates: CandidateSignal[] = [];
 
-      // A. Deployments (Take 51 for limit 50)
-      const deployments = await prisma.gitHubDeployment.findMany({
-        where: {
-          repository: {
-            organizationId,
-            projectId: incident.projectId,
-            ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
-          },
-          createdAt: { gte: windowStart, lte: windowEnd },
-        },
-        orderBy: { createdAt: 'desc' },
-        take: 51,
-        include: { repository: true },
-      });
-
-      if (deployments.length > 50) {
-        isTruncated = true;
-        deployments.pop(); // Retain top 50
-      }
-
-      for (const d of deployments) {
-        candidates.push({
-          type: EvidenceType.GITHUB_DEPLOYMENT,
-          externalRefId: `deploy:${d.deploymentId}`,
-          title: `GitHub Deployment to ${d.environment} (${d.state})`,
-          description: `Environment: ${d.environment} | State: ${d.state} | Commit: ${d.commitSha.substring(0, 7)}`,
-          url: d.url || d.repository.url,
-          occurredAt: d.createdAt,
-          serviceId: d.repository.serviceId,
-          environment: d.environment.toUpperCase(),
-          metadata: {
-            deploymentId: d.deploymentId,
-            commitSha: d.commitSha,
-            environment: d.environment,
-            state: d.state,
-            creator: d.creator,
-          },
-          rawEntity: d,
-        });
-      }
-
-      // B. Commits (Take 101 for limit 100)
-      const commits = await prisma.gitHubCommit.findMany({
-        where: {
-          repository: {
-            organizationId,
-            projectId: incident.projectId,
-            ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
-          },
-          committedAt: { gte: windowStart, lte: windowEnd },
-        },
-        orderBy: { committedAt: 'desc' },
-        take: 101,
-        include: { repository: true },
-      });
-
-      if (commits.length > 100) {
-        isTruncated = true;
-        commits.pop();
-      }
-
-      for (const c of commits) {
-        candidates.push({
-          type: EvidenceType.GITHUB_COMMIT,
-          externalRefId: `commit:${c.sha}`,
-          title: `Commit ${c.sha.substring(0, 7)}: ${c.message.split('\n')[0]}`,
-          description: `Author: ${c.authorName} | Branch: ${c.branch}`,
-          url: c.url,
-          occurredAt: c.committedAt,
-          serviceId: c.repository.serviceId,
-          environment: 'PRODUCTION', // Default branch commits
-          metadata: {
-            sha: c.sha,
-            authorName: c.authorName,
-            branch: c.branch,
-            message: c.message,
-          },
-          rawEntity: c,
-        });
-      }
-
-      // C. Pull Requests (Take 51 for limit 50)
-      const pullRequests = await prisma.gitHubPullRequest.findMany({
-        where: {
-          repository: {
-            organizationId,
-            projectId: incident.projectId,
-            ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
-          },
-          updatedAt: { gte: windowStart, lte: windowEnd },
-        },
-        orderBy: { updatedAt: 'desc' },
-        take: 51,
-        include: { repository: true },
-      });
-
-      if (pullRequests.length > 50) {
-        isTruncated = true;
-        pullRequests.pop();
-      }
-
-      for (const pr of pullRequests) {
-        candidates.push({
-          type: EvidenceType.GITHUB_PR,
-          externalRefId: `pr:${pr.repositoryId}:${pr.number}`,
-          title: `PR #${pr.number}: ${pr.title}`,
-          description: `State: ${pr.state} | Author: ${pr.author} | Target: ${pr.targetBranch}`,
-          url: pr.url,
-          occurredAt: pr.mergedAt || pr.updatedAt,
-          serviceId: pr.repository.serviceId,
-          environment: 'PRODUCTION',
-          metadata: {
-            number: pr.number,
-            state: pr.state,
-            author: pr.author,
-            branch: pr.branch,
-          },
-          rawEntity: pr,
-        });
-      }
-
-      // D. Sentry Issues (Take 51 for limit 50)
-      const sentryIssues = await prisma.sentryIssue.findMany({
-        where: {
-          organizationId,
-          projectId: incident.projectId,
-          ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
-          lastSeen: { gte: windowStart, lte: windowEnd },
-        },
-        orderBy: { lastSeen: 'desc' },
-        take: 51,
-      });
-
-      if (sentryIssues.length > 50) {
-        isTruncated = true;
-        sentryIssues.pop();
-      }
-
-      for (const s of sentryIssues) {
-        candidates.push({
-          type: EvidenceType.SENTRY_ERROR,
-          externalRefId: `sentry:${s.sentryIssueId}`,
-          title: `Sentry Issue ${s.sentryIssueId}: ${s.title}`,
-          description: `Level: ${s.level} | Users: ${s.userCount} | Events: ${s.eventCount} | Culprit: ${s.culprit || 'N/A'}`,
-          url: s.permalink,
-          occurredAt: s.lastSeen,
-          serviceId: s.serviceId,
-          environment: s.environment.toUpperCase(),
-          metadata: {
-            sentryIssueId: s.sentryIssueId,
-            level: s.level,
-            userCount: s.userCount,
-            eventCount: s.eventCount,
-            culprit: s.culprit,
-            release: s.release,
-          },
-          rawEntity: s,
-        });
-      }
-
-      // E. Workflow Runs (Take 51 for limit 50)
-      const workflowRuns = await prisma.gitHubWorkflowRun.findMany({
-        where: {
-          repository: {
-            organizationId,
-            projectId: incident.projectId,
-            ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
-          },
-          createdAt: { gte: windowStart, lte: windowEnd },
-        },
-        orderBy: { createdAt: 'desc' },
-        take: 51,
-        include: { repository: true },
-      });
-
-      if (workflowRuns.length > 50) {
-        isTruncated = true;
-        workflowRuns.pop();
-      }
-
-      for (const wf of workflowRuns) {
-        candidates.push({
-          type: EvidenceType.GITHUB_WORKFLOW_RUN,
-          externalRefId: `workflow:${wf.runId}`,
-          title: `Workflow ${wf.name} (${wf.conclusion || wf.status})`,
-          description: `Event: ${wf.event} | Branch: ${wf.branch} | Commit: ${wf.commitSha.substring(0, 7)}`,
-          url: wf.url,
-          occurredAt: wf.createdAt,
-          serviceId: wf.repository.serviceId,
-          environment: 'PRODUCTION',
-          metadata: {
-            runId: wf.runId,
-            name: wf.name,
-            conclusion: wf.conclusion,
-            status: wf.status,
-            commitSha: wf.commitSha,
-          },
-          rawEntity: wf,
-        });
-      }
-
-      // =========================================================================
-      // STAGE 1 & 2: Score Deployments & Identify Correlated Deployment Anchors
-      // =========================================================================
-      const scoredCandidates: CandidateScoreResult[] = [];
-      const correlatedCommitShas = new Set<string>();
-
-      for (const c of candidates) {
-        const deltaMs = Math.abs(c.occurredAt.getTime() - incident.detectedAt.getTime());
-        const deltaMins = deltaMs / (1000 * 60);
-        const tempScore = Math.max(0, 1.0 - deltaMins / 150.0) * 0.20; // Temporal decay over 2.5h
-        const isTemporalProximity = deltaMins <= 60;
-
-        const isServiceMatch = Boolean(incident.serviceId && c.serviceId === incident.serviceId);
-        const serviceScore = isServiceMatch ? 0.25 : 0.0;
-
-        const normalizedIncEnv = incident.environment.toUpperCase();
-        const isEnvMatch = c.environment === normalizedIncEnv;
-        const envScore = isEnvMatch ? 0.15 : c.environment === 'STAGING' ? 0.09 : 0.045;
-
-        if (c.type === EvidenceType.GITHUB_DEPLOYMENT) {
-          const isPrecursor = c.occurredAt <= incident.detectedAt && deltaMins <= 60;
-          const precursorScore = isPrecursor ? 0.25 : 0.0;
-
-          const baseScore = serviceScore + envScore + tempScore + precursorScore;
-          const finalRawScore = baseScore;
-          const confidence = Math.min(1.0, finalRawScore);
-
-          if (finalRawScore >= 0.65) {
-            const meta = c.metadata as { commitSha?: string };
-            if (meta.commitSha) {
-              correlatedCommitShas.add(meta.commitSha);
-            }
-          }
-
-          let tier: EvidenceConfidenceTier = EvidenceConfidenceTier.LOW;
-          if (confidence >= 0.8) tier = EvidenceConfidenceTier.HIGH;
-          else if (confidence >= 0.5) tier = EvidenceConfidenceTier.MEDIUM;
-
-          scoredCandidates.push({
-            candidate: c,
-            baseScore,
-            commitPropagationBoost: 0,
-            prPropagationBoost: 0,
-            finalRawScore,
-            confidence,
-            confidenceTier: tier,
-            reasons: {
-              temporalProximity: isTemporalProximity,
-              projectMatch: true,
-              serviceMatch: isServiceMatch,
-              environmentMatch: isEnvMatch,
-              deploymentRelation: true,
-              commitRelation: false,
-              sentrySpike: false,
-              workflowFailure: false,
+      // A. Deployments (Bidirectional bounded queries: cap at 50 nearest)
+      const depCap = 50;
+      const [precursorDeployments, postDeployments] = await Promise.all([
+        prisma.gitHubDeployment.findMany({
+          where: {
+            repository: {
+              organizationId,
+              projectId: incident.projectId,
+              ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
             },
-            scoreBreakdown: {
-              serviceScore,
-              envScore,
-              tempScore,
-              precursorScore,
+            createdAt: { gte: windowStart, lte: incident.detectedAt },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: depCap + 1,
+          include: { repository: true },
+        }),
+        prisma.gitHubDeployment.findMany({
+          where: {
+            repository: {
+              organizationId,
+              projectId: incident.projectId,
+              ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
+            },
+            createdAt: { gt: incident.detectedAt, lte: windowEnd },
+          },
+          orderBy: { createdAt: 'asc' },
+          take: depCap + 1,
+          include: { repository: true },
+        }),
+      ]);
+
+      if (precursorDeployments.length > depCap || postDeployments.length > depCap) {
+        isTruncated = true;
+      }
+
+      const mergedDeployments = [
+        ...precursorDeployments.slice(0, depCap),
+        ...postDeployments.slice(0, depCap),
+      ];
+
+      const deploymentSignals: CandidateSignal[] = mergedDeployments.map((d) => ({
+        type: EvidenceType.GITHUB_DEPLOYMENT,
+        externalRefId: `deploy:${d.deploymentId}`,
+        title: `GitHub Deployment to ${d.environment} (${d.state})`,
+        description: `Environment: ${d.environment} | State: ${d.state} | Commit: ${d.commitSha.substring(0, 7)}`,
+        url: d.url || d.repository.url,
+        occurredAt: d.createdAt,
+        serviceId: d.repository.serviceId,
+        environment: d.environment,
+        metadata: {
+          deploymentId: d.deploymentId,
+          commitSha: d.commitSha,
+          environment: d.environment,
+          state: d.state,
+          creator: d.creator,
+          projectId: d.repository.projectId,
+        },
+        rawEntity: d,
+      }));
+
+      const depSelection = selectNearestCandidates(deploymentSignals, incident.detectedAt, depCap);
+      if (depSelection.isTruncated) isTruncated = true;
+      allCandidates.push(...depSelection.retained);
+
+      // B. Commits (Bidirectional bounded queries: cap at 100 nearest)
+      const commitCap = 100;
+      const [precursorCommits, postCommits] = await Promise.all([
+        prisma.gitHubCommit.findMany({
+          where: {
+            repository: {
+              organizationId,
+              projectId: incident.projectId,
+              ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
+            },
+            committedAt: { gte: windowStart, lte: incident.detectedAt },
+          },
+          orderBy: { committedAt: 'desc' },
+          take: commitCap + 1,
+          include: { repository: true },
+        }),
+        prisma.gitHubCommit.findMany({
+          where: {
+            repository: {
+              organizationId,
+              projectId: incident.projectId,
+              ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
+            },
+            committedAt: { gt: incident.detectedAt, lte: windowEnd },
+          },
+          orderBy: { committedAt: 'asc' },
+          take: commitCap + 1,
+          include: { repository: true },
+        }),
+      ]);
+
+      if (precursorCommits.length > commitCap || postCommits.length > commitCap) {
+        isTruncated = true;
+      }
+
+      const mergedCommits = [
+        ...precursorCommits.slice(0, commitCap),
+        ...postCommits.slice(0, commitCap),
+      ];
+
+      const commitSignals: CandidateSignal[] = mergedCommits.map((c) => ({
+        type: EvidenceType.GITHUB_COMMIT,
+        externalRefId: `commit:${c.sha}`,
+        title: `Commit ${c.sha.substring(0, 7)}: ${c.message.split('\n')[0]}`,
+        description: `Author: ${c.authorName} | Branch: ${c.branch}`,
+        url: c.url,
+        occurredAt: c.committedAt,
+        serviceId: c.repository.serviceId,
+        environment: 'UNKNOWN', // Environment-neutral unless deployment linked
+        metadata: {
+          sha: c.sha,
+          authorName: c.authorName,
+          branch: c.branch,
+          message: c.message,
+          projectId: c.repository.projectId,
+        },
+        rawEntity: c,
+      }));
+
+      const commitSelection = selectNearestCandidates(commitSignals, incident.detectedAt, commitCap);
+      if (commitSelection.isTruncated) isTruncated = true;
+      allCandidates.push(...commitSelection.retained);
+
+      // C. Pull Requests (Bidirectional bounded queries: cap at 50 nearest)
+      const prCap = 50;
+      const [precursorPRs, postPRs] = await Promise.all([
+        prisma.gitHubPullRequest.findMany({
+          where: {
+            repository: {
+              organizationId,
+              projectId: incident.projectId,
+              ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
+            },
+            updatedAt: { gte: windowStart, lte: incident.detectedAt },
+          },
+          orderBy: { updatedAt: 'desc' },
+          take: prCap + 1,
+          include: { repository: true },
+        }),
+        prisma.gitHubPullRequest.findMany({
+          where: {
+            repository: {
+              organizationId,
+              projectId: incident.projectId,
+              ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
+            },
+            updatedAt: { gt: incident.detectedAt, lte: windowEnd },
+          },
+          orderBy: { updatedAt: 'asc' },
+          take: prCap + 1,
+          include: { repository: true },
+        }),
+      ]);
+
+      if (precursorPRs.length > prCap || postPRs.length > prCap) {
+        isTruncated = true;
+      }
+
+      const mergedPRs = [
+        ...precursorPRs.slice(0, prCap),
+        ...postPRs.slice(0, prCap),
+      ];
+
+      const prSignals: CandidateSignal[] = mergedPRs.map((pr) => ({
+        type: EvidenceType.GITHUB_PR,
+        externalRefId: `pr:${pr.repositoryId}:${pr.number}`,
+        title: `PR #${pr.number}: ${pr.title}`,
+        description: `State: ${pr.state} | Author: ${pr.author} | Target: ${pr.targetBranch}`,
+        url: pr.url,
+        occurredAt: pr.mergedAt || pr.updatedAt,
+        serviceId: pr.repository.serviceId,
+        environment: 'UNKNOWN', // Environment-neutral
+        metadata: {
+          number: pr.number,
+          state: pr.state,
+          author: pr.author,
+          branch: pr.branch,
+          mergedAt: pr.mergedAt,
+          projectId: pr.repository.projectId,
+        },
+        rawEntity: pr,
+      }));
+
+      const prSelection = selectNearestCandidates(prSignals, incident.detectedAt, prCap);
+      if (prSelection.isTruncated) isTruncated = true;
+      allCandidates.push(...prSelection.retained);
+
+      // D. Sentry Issues (Bidirectional bounded queries: cap at 50 nearest)
+      const sentryCap = 50;
+      const [precursorSentry, postSentry] = await Promise.all([
+        prisma.sentryIssue.findMany({
+          where: {
+            organizationId,
+            projectId: incident.projectId,
+            ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
+            lastSeen: { gte: windowStart, lte: incident.detectedAt },
+          },
+          orderBy: { lastSeen: 'desc' },
+          take: sentryCap + 1,
+        }),
+        prisma.sentryIssue.findMany({
+          where: {
+            organizationId,
+            projectId: incident.projectId,
+            ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
+            lastSeen: { gt: incident.detectedAt, lte: windowEnd },
+          },
+          orderBy: { lastSeen: 'asc' },
+          take: sentryCap + 1,
+        }),
+      ]);
+
+      if (precursorSentry.length > sentryCap || postSentry.length > sentryCap) {
+        isTruncated = true;
+      }
+
+      const mergedSentry = [
+        ...precursorSentry.slice(0, sentryCap),
+        ...postSentry.slice(0, sentryCap),
+      ];
+
+      const sentrySignals: CandidateSignal[] = mergedSentry.map((s) => ({
+        type: EvidenceType.SENTRY_ERROR,
+        externalRefId: `sentry:${s.sentryIssueId}`,
+        title: `Sentry Issue ${s.sentryIssueId}: ${s.title}`,
+        description: `Level: ${s.level} | Users: ${s.userCount} | Events: ${s.eventCount} | Culprit: ${s.culprit || 'N/A'}`,
+        url: s.permalink,
+        occurredAt: s.lastSeen,
+        serviceId: s.serviceId,
+        environment: s.environment,
+        metadata: {
+          sentryIssueId: s.sentryIssueId,
+          level: s.level,
+          userCount: s.userCount,
+          eventCount: s.eventCount,
+          culprit: s.culprit,
+          release: s.release,
+          firstSeen: s.firstSeen,
+          lastSeen: s.lastSeen,
+          projectId: s.projectId,
+        },
+        rawEntity: s,
+      }));
+
+      const sentrySelection = selectNearestCandidates(sentrySignals, incident.detectedAt, sentryCap);
+      if (sentrySelection.isTruncated) isTruncated = true;
+      allCandidates.push(...sentrySelection.retained);
+
+      // E. Workflow Runs (Bidirectional bounded queries: cap at 50 nearest)
+      const wfCap = 50;
+      const [precursorWorkflows, postWorkflows] = await Promise.all([
+        prisma.gitHubWorkflowRun.findMany({
+          where: {
+            repository: {
+              organizationId,
+              projectId: incident.projectId,
+              ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
+            },
+            createdAt: { gte: windowStart, lte: incident.detectedAt },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: wfCap + 1,
+          include: { repository: true },
+        }),
+        prisma.gitHubWorkflowRun.findMany({
+          where: {
+            repository: {
+              organizationId,
+              projectId: incident.projectId,
+              ...(incident.serviceId ? { serviceId: incident.serviceId } : {}),
+            },
+            createdAt: { gt: incident.detectedAt, lte: windowEnd },
+          },
+          orderBy: { createdAt: 'asc' },
+          take: wfCap + 1,
+          include: { repository: true },
+        }),
+      ]);
+
+      if (precursorWorkflows.length > wfCap || postWorkflows.length > wfCap) {
+        isTruncated = true;
+      }
+
+      const mergedWorkflows = [
+        ...precursorWorkflows.slice(0, wfCap),
+        ...postWorkflows.slice(0, wfCap),
+      ];
+
+      const workflowSignals: CandidateSignal[] = mergedWorkflows.map((wf) => ({
+        type: EvidenceType.GITHUB_WORKFLOW_RUN,
+        externalRefId: `workflow:${wf.runId}`,
+        title: `Workflow ${wf.name} (${wf.conclusion || wf.status})`,
+        description: `Event: ${wf.event} | Branch: ${wf.branch} | Commit: ${wf.commitSha.substring(0, 7)}`,
+        url: wf.url,
+        occurredAt: wf.createdAt,
+        serviceId: wf.repository.serviceId,
+        environment: 'UNKNOWN', // Environment-neutral
+        metadata: {
+          runId: wf.runId,
+          name: wf.name,
+          conclusion: wf.conclusion,
+          status: wf.status,
+          commitSha: wf.commitSha,
+          projectId: wf.repository.projectId,
+        },
+        rawEntity: wf,
+      }));
+
+      const workflowSelection = selectNearestCandidates(workflowSignals, incident.detectedAt, wfCap);
+      if (workflowSelection.isTruncated) isTruncated = true;
+      allCandidates.push(...workflowSelection.retained);
+
+      // =========================================================================
+      // STAGE 2: Pure Deterministic Scoring Core
+      // =========================================================================
+      const scoringContext: IncidentScoringContext = {
+        incidentId,
+        organizationId,
+        projectId: incident.projectId,
+        serviceId: incident.serviceId,
+        environment: incident.environment,
+        detectedAt: incident.detectedAt,
+      };
+
+      const scoredCandidates = scoreAllCandidates(allCandidates, scoringContext);
+
+      // =========================================================================
+      // STAGE 3: Atomic Persistence Transaction
+      // =========================================================================
+      await prisma.$transaction(async (tx) => {
+        // 1. Upsert all current-run scored evidence
+        for (const sc of scoredCandidates) {
+          await tx.incidentEvidence.upsert({
+            where: {
+              incidentId_type_externalRefId: {
+                incidentId,
+                type: sc.candidate.type,
+                externalRefId: sc.candidate.externalRefId,
+              },
+            },
+            create: {
+              incidentId,
+              correlationRunId: correlationRun.id,
+              type: sc.candidate.type,
+              source: EvidenceSource.CORRELATION_ENGINE,
+              externalRefId: sc.candidate.externalRefId,
+              confidenceTier: sc.confidenceTier,
+              title: sc.candidate.title,
+              description: sc.candidate.description,
+              url: sc.candidate.url,
+              confidence: sc.confidence,
+              reasons: sc.reasons as unknown as Prisma.InputJsonValue,
+              scoreBreakdown: sc.scoreBreakdown,
+              metadata: sc.candidate.metadata as unknown as Prisma.InputJsonValue,
+            },
+            update: {
+              correlationRunId: correlationRun.id,
+              confidenceTier: sc.confidenceTier,
+              confidence: sc.confidence,
+              reasons: sc.reasons as unknown as Prisma.InputJsonValue,
+              scoreBreakdown: sc.scoreBreakdown,
+              metadata: sc.candidate.metadata as unknown as Prisma.InputJsonValue,
+              title: sc.candidate.title,
+              description: sc.candidate.description,
+              url: sc.candidate.url,
+              updatedAt: new Date(),
             },
           });
         }
-      }
 
-      // =========================================================================
-      // STAGE 3 & 4: Propagate Boosts to Commits/PRs and Evaluate Sentry/Workflows
-      // =========================================================================
-      for (const c of candidates) {
-        if (c.type === EvidenceType.GITHUB_DEPLOYMENT) continue; // Already processed in Stage 1 & 2
-
-        const deltaMs = Math.abs(c.occurredAt.getTime() - incident.detectedAt.getTime());
-        const deltaMins = deltaMs / (1000 * 60);
-        const tempScore = Math.max(0, 1.0 - deltaMins / 150.0) * 0.20;
-        const isTemporalProximity = deltaMins <= 60;
-
-        const isServiceMatch = Boolean(incident.serviceId && c.serviceId === incident.serviceId);
-        const serviceScore = isServiceMatch ? 0.25 : 0.0;
-
-        const normalizedIncEnv = incident.environment.toUpperCase();
-        const isEnvMatch = c.environment === normalizedIncEnv;
-        const envScore = isEnvMatch ? 0.15 : c.environment === 'STAGING' ? 0.09 : 0.045;
-
-        let baseScore = serviceScore + envScore + tempScore;
-        let commitPropBoost = 0;
-        let prPropBoost = 0;
-
-        let isSentrySpike = false;
-        let isWorkflowFailure = false;
-        let isCommitRelation = false;
-        let isDeploymentRelation = false;
-
-        if (c.type === EvidenceType.GITHUB_COMMIT) {
-          const meta = c.metadata as { sha?: string };
-          if (meta.sha && correlatedCommitShas.has(meta.sha)) {
-            commitPropBoost = 0.25;
-            isCommitRelation = true;
-            isDeploymentRelation = true;
-          }
-        } else if (c.type === EvidenceType.GITHUB_PR) {
-          const meta = c.metadata as { branch?: string };
-          // Check if PR branch relates to correlated commit
-          if (meta.branch && Array.from(correlatedCommitShas).length > 0) {
-            commitPropBoost = 0.25;
-            prPropBoost = 0.15;
-            isCommitRelation = true;
-            isDeploymentRelation = true;
-          }
-        } else if (c.type === EvidenceType.SENTRY_ERROR) {
-          const meta = c.metadata as { userCount?: number; level?: string };
-          if ((meta.userCount && meta.userCount >= 5) || meta.level === 'fatal') {
-            baseScore += 0.25;
-            isSentrySpike = true;
-          }
-        } else if (c.type === EvidenceType.GITHUB_WORKFLOW_RUN) {
-          const meta = c.metadata as { conclusion?: string };
-          if (meta.conclusion === 'failure') {
-            baseScore += 0.25;
-            isWorkflowFailure = true;
-          }
-        }
-
-        const finalRawScore = baseScore + commitPropBoost + prPropBoost;
-        const confidence = Math.min(1.0, finalRawScore);
-
-        if (confidence < 0.2) continue; // Discard background noise (< 0.20)
-
-        let tier: EvidenceConfidenceTier = EvidenceConfidenceTier.LOW;
-        if (confidence >= 0.8) tier = EvidenceConfidenceTier.HIGH;
-        else if (confidence >= 0.5) tier = EvidenceConfidenceTier.MEDIUM;
-
-        scoredCandidates.push({
-          candidate: c,
-          baseScore,
-          commitPropagationBoost: commitPropBoost,
-          prPropagationBoost: prPropBoost,
-          finalRawScore,
-          confidence,
-          confidenceTier: tier,
-          reasons: {
-            temporalProximity: isTemporalProximity,
-            projectMatch: true,
-            serviceMatch: isServiceMatch,
-            environmentMatch: isEnvMatch,
-            deploymentRelation: isDeploymentRelation,
-            commitRelation: isCommitRelation,
-            sentrySpike: isSentrySpike,
-            workflowFailure: isWorkflowFailure,
-          },
-          scoreBreakdown: {
-            serviceScore,
-            envScore,
-            tempScore,
-            commitPropBoost,
-            prPropBoost,
-          },
-        });
-      }
-
-      // =========================================================================
-      // STAGE 4: Idempotent Database Upsert & Notifications
-      // =========================================================================
-      let correlatedCount = 0;
-
-      for (const sc of scoredCandidates) {
-        await prisma.incidentEvidence.upsert({
-          where: {
-            incidentId_type_externalRefId: {
-              incidentId,
-              type: sc.candidate.type,
-              externalRefId: sc.candidate.externalRefId,
-            },
-          },
-          create: {
-            incidentId,
-            correlationRunId: correlationRun.id,
-            type: sc.candidate.type,
-            source: EvidenceSource.CORRELATION_ENGINE,
-            externalRefId: sc.candidate.externalRefId,
-            confidenceTier: sc.confidenceTier,
-            title: sc.candidate.title,
-            description: sc.candidate.description,
-            url: sc.candidate.url,
-            confidence: sc.confidence,
-            reasons: sc.reasons,
-            scoreBreakdown: sc.scoreBreakdown,
-            metadata: sc.candidate.metadata as unknown as Prisma.InputJsonValue,
-          },
-          update: {
-            correlationRunId: correlationRun.id,
-            confidenceTier: sc.confidenceTier,
-            confidence: sc.confidence,
-            reasons: sc.reasons,
-            scoreBreakdown: sc.scoreBreakdown,
-            metadata: sc.candidate.metadata as unknown as Prisma.InputJsonValue,
-            updatedAt: new Date(),
-          },
-        });
-        correlatedCount++;
-      }
-
-      // Update CorrelationRun summary
-      await prisma.correlationRun.update({
-        where: { id: correlationRun.id },
-        data: {
-          status: CorrelationRunStatus.COMPLETED,
-          candidateCount: candidates.length,
-          correlatedCount,
-          isTruncated,
-          completedAt: new Date(),
-        },
-      });
-
-      // Log audit timeline event (tagged metadata.correlationRun = true for loop prevention)
-      await prisma.incidentEvent.create({
-        data: {
-          incidentId,
-          organizationId,
-          userId: triggeredById || null,
-          source: 'SYSTEM',
-          type: 'CORRELATION_RUN_COMPLETED',
-          message: `Correlation Engine executed (${correlatedCount} evidence items ranked, isTruncated=${isTruncated})`,
-          metadata: {
-            automated: true,
-            correlationRun: true,
-            runId: correlationRun.id,
-            candidateCount: candidates.length,
-            correlatedCount,
+        // 2. Mark CorrelationRun completed
+        await tx.correlationRun.update({
+          where: { id: correlationRun.id },
+          data: {
+            status: CorrelationRunStatus.COMPLETED,
+            candidateCount: allCandidates.length,
+            correlatedCount: scoredCandidates.length,
             isTruncated,
+            completedAt: new Date(),
           },
-          occurredAt: new Date(),
-        },
+        });
+
+        // 3. Create exactly one completion timeline event
+        await tx.incidentEvent.create({
+          data: {
+            incidentId,
+            organizationId,
+            userId: triggeredById || null,
+            source: 'SYSTEM',
+            type: 'CORRELATION_RUN_COMPLETED',
+            message: `Correlation Engine executed (${scoredCandidates.length} evidence items ranked, isTruncated=${isTruncated})`,
+            metadata: {
+              automated: true,
+              correlationRun: true,
+              runId: correlationRun.id,
+              candidateCount: allCandidates.length,
+              correlatedCount: scoredCandidates.length,
+              isTruncated,
+            },
+            occurredAt: new Date(),
+          },
+        });
       });
 
-      // Broadcast Socket.IO event: CORRELATION_COMPLETED
+      // Post-commit broadcast
       broadcastToIncident(incidentId, 'CORRELATION_COMPLETED', {
         incidentId,
         runId: correlationRun.id,
-        correlatedCount,
+        correlatedCount: scoredCandidates.length,
         isTruncated,
         completedAt: new Date().toISOString(),
       });
 
-      return { runId: correlationRun.id, status: 'completed', correlatedCount };
+      return { runId: correlationRun.id, status: 'completed', correlatedCount: scoredCandidates.length };
     } catch (err: unknown) {
       logger.error({ err, incidentId }, 'Correlation run failed');
       if (correlationRunId) {
-        await prisma.correlationRun.update({
-          where: { id: correlationRunId },
-          data: {
-            status: CorrelationRunStatus.FAILED,
-            error: (err as Error).message,
-            completedAt: new Date(),
-          },
-        });
+        try {
+          const sanitizedError =
+            err instanceof Error ? err.message.replace(/[\r\n]+/g, ' ').substring(0, 200) : 'Internal correlation failure';
+          await prisma.correlationRun.update({
+            where: { id: correlationRunId },
+            data: {
+              status: CorrelationRunStatus.FAILED,
+              error: sanitizedError,
+              completedAt: new Date(),
+            },
+          });
+        } catch (updateErr) {
+          logger.error({ updateErr }, 'Failed to record failed correlation run status');
+        }
       }
       throw err;
     } finally {
       // Safe Redis Lock Release (Lua Script)
       try {
-        if (redis.status === 'ready') {
+        if (redisLockAcquired && redis.status === 'ready') {
           const releaseScript = `
             if redis.call("get", KEYS[1]) == ARGV[1] then
               return redis.call("del", KEYS[1])
@@ -573,12 +568,15 @@ export class CorrelationService {
         }
       } catch {
         // Ignore lock release error
+      } finally {
+        CorrelationService.inProcessLocks.delete(incidentId);
       }
     }
   }
 
   /**
-   * Retrieves latest correlation runs and ranked evidence for an incident.
+   * Retrieves latest completed correlation run and its ranked evidence for an incident.
+   * Stale evidence from previous runs is hidden from the active list, while preserving manual evidence.
    */
   public static async getCorrelationEvidence(
     organizationId: string,
@@ -592,9 +590,9 @@ export class CorrelationService {
       throw new NotFoundError('Incident not found in organization');
     }
 
-    const evidenceList = await prisma.incidentEvidence.findMany({
-      where: { incidentId },
-      orderBy: [{ confidence: 'desc' }, { addedAt: 'desc' }],
+    const latestCompletedRun = await prisma.correlationRun.findFirst({
+      where: { organizationId, incidentId, status: CorrelationRunStatus.COMPLETED },
+      orderBy: { completedAt: 'desc' },
     });
 
     const latestRun = await prisma.correlationRun.findFirst({
@@ -602,9 +600,31 @@ export class CorrelationService {
       orderBy: { startedAt: 'desc' },
     });
 
+    const whereClause: Prisma.IncidentEvidenceWhereInput = latestCompletedRun
+      ? {
+          incidentId,
+          OR: [
+            { source: { not: EvidenceSource.CORRELATION_ENGINE } },
+            {
+              source: EvidenceSource.CORRELATION_ENGINE,
+              correlationRunId: latestCompletedRun.id,
+            },
+          ],
+        }
+      : {
+          incidentId,
+          source: { not: EvidenceSource.CORRELATION_ENGINE },
+        };
+
+    const evidenceList = await prisma.incidentEvidence.findMany({
+      where: whereClause,
+      orderBy: [{ confidence: 'desc' }, { addedAt: 'desc' }],
+    });
+
     return {
       incidentId,
       latestRun,
+      latestCompletedRun,
       evidence: evidenceList,
     };
   }
@@ -626,7 +646,7 @@ export class CorrelationService {
 
     return prisma.correlationRun.findMany({
       where: { organizationId, incidentId },
-      orderBy: { startedAt: 'desc' },
+      orderBy: [{ startedAt: 'desc' }, { id: 'asc' }],
       take: 20,
     });
   }

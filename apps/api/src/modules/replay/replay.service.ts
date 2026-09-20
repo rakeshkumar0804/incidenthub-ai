@@ -1,26 +1,45 @@
 import crypto from 'crypto';
-import type { Prisma } from '@prisma/client';
 import {
+  Prisma,
   ReplayRunStatus,
   ReplayTriggerType,
   ReplayCategory,
   EventSource,
 } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
-import { redis } from '../../lib/redis';
+import { redis, acquireDistributedLock, verifyLockOwnership, releaseDistributedLock } from '../../lib/redis';
 import { logger } from '../../utils/logger';
-import { NotFoundError } from '../../utils/errors';
+import { NotFoundError, LockOwnershipLostError } from '../../utils/errors';
 import { broadcastToIncident } from '../../lib/socket';
+import { sanitizeString, sanitizeRecursive } from '../ai/sanitizer';
 import type { NormalizedReplayEventInput } from './replay.types';
+import {
+  MAX_REPLAY_EVENTS,
+  CATEGORY_WEIGHTS,
+  calculateReplayWindow,
+  resolveEvidenceTimestamp,
+  deduplicateAndRetainEvents,
+  createIncidentDetectedEvent,
+  cleanReplayText,
+} from './replay.engine';
 
 export class ReplayService {
+  private static localInFlight = new Set<string>();
+
   public static async runReplay(
     organizationId: string,
     incidentId: string,
     triggeredById?: string,
     triggerType: ReplayTriggerType = ReplayTriggerType.MANUAL_REQUEST,
   ): Promise<{ runId: string; status: string }> {
-    // 1. Multi-tenant Guard & Incident Fetch
+    // 1. Process-Local Concurrency Guard (synchronous check before any await)
+    if (ReplayService.localInFlight.has(incidentId)) {
+      logger.info({ incidentId }, 'Replay run already in progress locally');
+      return { runId: 'none', status: 'skipped_lock_active' };
+    }
+    ReplayService.localInFlight.add(incidentId);
+
+    // 2. Multi-tenant Guard & Incident Fetch
     const incident = await prisma.incident.findFirst({
       where: { id: incidentId, organizationId },
       include: {
@@ -30,43 +49,93 @@ export class ReplayService {
     });
 
     if (!incident) {
+      ReplayService.localInFlight.delete(incidentId);
       throw new NotFoundError('Incident not found in organization');
     }
 
-    // 2. Redis Distributed Locking (45s TTL)
+    // 3. Redis Distributed Locking with Ownership-Safe Heartbeat (45s TTL)
     const lockKey = `lock:replay:${incidentId}`;
     const lockVal = crypto.randomUUID();
-    let lockAcquired = true;
+    const lockTtlMs = 45000;
+    let renewalTimer: NodeJS.Timeout | null = null;
+    let lockLost = false;
+    let isRenewing = false;
 
-    try {
-      if (redis.status !== 'ready' && redis.status !== 'connecting') {
-        await Promise.race([redis.connect(), new Promise((r) => setTimeout(r, 300))]);
-      }
-
-      if (redis.status === 'ready') {
-        const existingLock = await redis.get(lockKey);
-        if (existingLock) {
-          lockAcquired = false;
-        } else {
-          await redis.set(lockKey, lockVal, 'PX', 45000, 'NX');
-        }
-      }
-    } catch {
-      // Fallback if Redis is unavailable
+    // Atomic lock acquisition: fails closed (503) in production if Redis is unavailable or throws
+    const lockResult = await acquireDistributedLock(lockKey, lockVal, lockTtlMs, 'replay_execution');
+    if (!lockResult.acquired) {
+      ReplayService.localInFlight.delete(incidentId);
+      logger.info({ incidentId }, 'Incident Replay run already in progress (lock active)');
+      return { runId: 'none', status: 'skipped_lock_active' };
     }
 
-    if (!lockAcquired) {
-      logger.info({ incidentId }, 'Incident Replay run already in progress (Redis lock active)');
-      return { runId: 'none', status: 'skipped: lock active' };
+    const redisLockAcquired = lockResult.isRedisLock;
+
+    if (redisLockAcquired) {
+      // Start safe background renewal timer (heartbeat every 10 seconds)
+      renewalTimer = setInterval(() => {
+        if (isRenewing || lockLost) return;
+        isRenewing = true;
+        const renewLua = `
+          if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("pexpire", KEYS[1], ARGV[2])
+          else
+            return 0
+          end
+        `;
+        redis
+          .eval(renewLua, 1, lockKey, lockVal, lockTtlMs)
+          .then((result) => {
+            if (result !== 1) {
+              lockLost = true;
+              logger.warn({ incidentId, lockKey }, 'Redis replay lock ownership lost during renewal heartbeat');
+            }
+          })
+          .catch((err) => {
+            logger.warn({ err, incidentId }, 'Redis replay lock renewal heartbeat failed');
+          })
+          .finally(() => {
+            isRenewing = false;
+          });
+      }, 10000);
     }
+
+    const verifyAndExtendLockOwnership = async (): Promise<boolean> => {
+      // 1. Stop scheduling new heartbeats
+      if (renewalTimer) {
+        clearInterval(renewalTimer);
+        renewalTimer = null;
+      }
+
+      // 2. Await any heartbeat renewal currently in flight
+      while (isRenewing) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      if (!redisLockAcquired) {
+        // Redis was unavailable; process-local guard is active and owned
+        return true;
+      }
+
+      if (lockLost) {
+        return false;
+      }
+
+      // 3. Perform final compare-and-renew check
+      const isOwner = await verifyLockOwnership(lockKey, lockVal, lockTtlMs);
+      if (!isOwner) {
+        lockLost = true;
+      }
+      return isOwner;
+    };
+
 
     let runId = '';
 
     try {
-      // 3. Define Replay Window
-      const windowStart = new Date(incident.detectedAt.getTime() - 2 * 60 * 60 * 1000); // detectedAt - 2h
-      const endAnchor = incident.resolvedAt || new Date();
-      const windowEnd = new Date(endAnchor.getTime() + 30 * 60 * 1000); // resolvedAt/now + 30m
+      // 4. Capture single execution cutoff & compute stable window
+      const executionCutoff = new Date();
+      const { windowStart, windowEnd } = calculateReplayWindow(incident, executionCutoff);
 
       // Create ReplayRun audit record (RUNNING)
       const replayRun = await prisma.replayRun.create({
@@ -90,308 +159,384 @@ export class ReplayService {
         startedAt: replayRun.startedAt.toISOString(),
       });
 
-      // 4. Source Aggregation & Ingestion (Bounded Limit 500 + 1)
-      const MAX_BOUND = 500;
-      let totalRawEvents = 0;
-      let isTruncated = false;
-
-      const rawEvents: NormalizedReplayEventInput[] = [];
-
-      // A. Incident Creation Event
-      rawEvents.push({
-        category: ReplayCategory.STATE_CHANGE,
-        categoryWeight: 10,
-        eventType: 'INCIDENT_CREATED',
-        source: EventSource.USER,
-        sourceEventId: `incident:${incident.id}:INCIDENT_CREATED:0`,
-        timestamp: incident.detectedAt,
-        actorName: incident.createdBy.name,
-        actorEmail: incident.createdBy.email,
-        title: `Incident ${incident.number} Detected: ${incident.title}`,
-        description: incident.description || `Severity: ${incident.severity}, Environment: ${incident.environment}`,
-        externalUrl: null,
-        evidenceId: null,
-        metadata: {
-          number: incident.number,
-          severity: incident.severity,
-          environment: incident.environment,
-          status: incident.status,
-        },
-      });
-
-      // B. IncidentEvent records
-      const incidentEventRecords = await prisma.incidentEvent.findMany({
-        where: {
-          incidentId,
-          organizationId,
-          occurredAt: { gte: windowStart, lte: windowEnd },
-        },
-        include: { user: true },
-        take: MAX_BOUND + 1,
-      });
-
-      if (incidentEventRecords.length > MAX_BOUND) {
-        isTruncated = true;
+      // 5. Final Lock-Ownership Gate (prior to entering DB transaction)
+      const isOwner = await verifyAndExtendLockOwnership();
+      if (!isOwner) {
+        throw new LockOwnershipLostError();
       }
 
-      for (const evt of incidentEventRecords.slice(0, MAX_BOUND)) {
-        // Skip internal engine completion messages if already handled to prevent duplicates/loops
-        if (
-          evt.type === 'AI_INVESTIGATION_COMPLETED' ||
-          evt.type === 'INCIDENT_REPLAY_COMPLETED' ||
-          evt.type === 'CORRELATION_COMPLETED'
-        ) {
-          continue;
-        }
+      // 6. Atomic Repeatable-Read Database Snapshot & Persistence
+      const [completedRun] = await prisma.$transaction(
+        async (tx) => {
+          const QUERY_BOUND = MAX_REPLAY_EVENTS + 1;
+          const RUN_SOURCE_CAP = 50;
+          let anySourceOverflow = false;
+          const candidateEvents: NormalizedReplayEventInput[] = [];
 
-        rawEvents.push({
-          category: ReplayCategory.STATE_CHANGE,
-          categoryWeight: 10,
-          eventType: evt.type,
-          source: evt.source,
-          sourceEventId: `incident_event:${evt.id}:${evt.type}:0`,
-          timestamp: evt.occurredAt,
-          actorName: evt.user?.name || (evt.source === EventSource.SYSTEM ? 'System Automator' : 'Automated Signal'),
-          actorEmail: evt.user?.email || null,
-          title: evt.message,
-          description: evt.message,
-          externalUrl: null,
-          evidenceId: null,
-          metadata: (evt.metadata as Record<string, unknown> | null) || null,
-        });
-      }
+          // A. Incident Detection Event
+          candidateEvents.push(createIncidentDetectedEvent(incident));
 
-      // C. IncidentEvidence records (GitHub Deployments, Commits, PRs, Sentry Errors)
-      const evidenceRecords = await prisma.incidentEvidence.findMany({
-        where: {
-          incidentId,
-          addedAt: { gte: windowStart, lte: windowEnd },
-        },
-        take: MAX_BOUND + 1,
-      });
+          // B. IncidentEvent records (State changes, actions, milestones)
+          const incidentEventRecords = await tx.incidentEvent.findMany({
+            where: {
+              incidentId,
+              organizationId,
+              occurredAt: { gte: windowStart, lte: windowEnd },
+            },
+            include: { user: true },
+            orderBy: [{ occurredAt: 'asc' }, { id: 'asc' }],
+            take: QUERY_BOUND,
+          });
 
-      if (evidenceRecords.length > MAX_BOUND) {
-        isTruncated = true;
-      }
+          if (incidentEventRecords.length > MAX_REPLAY_EVENTS) {
+            anySourceOverflow = true;
+          }
 
-      for (const ev of evidenceRecords.slice(0, MAX_BOUND)) {
-        const meta = (ev.metadata as Record<string, unknown> | null) || {};
-        let cat: ReplayCategory = ReplayCategory.TELEMETRY;
-        let weight = 20;
+          for (const evt of incidentEventRecords.slice(0, MAX_REPLAY_EVENTS)) {
+            const upperType = evt.type.toUpperCase();
+            if (
+              upperType === 'AI_INVESTIGATION_COMPLETED' ||
+              upperType === 'INCIDENT_REPLAY_COMPLETED' ||
+              upperType === 'CORRELATION_COMPLETED' ||
+              upperType === 'INCIDENT_REPLAY_STARTED' ||
+              upperType === 'INCIDENT_REPLAY_FAILED' ||
+              upperType === 'REPLAY_STARTED' ||
+              upperType === 'REPLAY_COMPLETED' ||
+              upperType === 'REPLAY_FAILED'
+            ) {
+              continue;
+            }
 
-        if (ev.type.startsWith('GITHUB_') || ev.type.startsWith('SENTRY_')) {
-          cat = ReplayCategory.TELEMETRY;
-          weight = 20;
-        }
+            candidateEvents.push({
+              category: ReplayCategory.STATE_CHANGE,
+              categoryWeight: CATEGORY_WEIGHTS[ReplayCategory.STATE_CHANGE],
+              eventType: evt.type,
+              source: evt.source,
+              sourceEventId: `incident_event:${evt.id}:${evt.type}:0`,
+              timestamp: evt.occurredAt,
+              actorName: evt.user?.name ? sanitizeString(evt.user.name) : (evt.source === EventSource.SYSTEM ? 'System' : 'Automated Monitor'),
+              actorEmail: null,
+              title: cleanReplayText(evt.message),
+              description: cleanReplayText(evt.message),
+              externalUrl: null,
+              evidenceId: null,
+              metadata: evt.metadata ? (sanitizeRecursive(evt.metadata) as Record<string, unknown>) : null,
+            });
+          }
 
-        rawEvents.push({
-          category: cat,
-          categoryWeight: weight,
-          eventType: ev.type,
-          source: ev.type.startsWith('GITHUB_') ? EventSource.GITHUB : ev.type.startsWith('SENTRY_') ? EventSource.SENTRY : EventSource.SYSTEM,
-          sourceEventId: `incident_evidence:${ev.id}:${ev.type}:0`,
-          timestamp: ev.addedAt,
-          actorName: (meta['author'] as string) || ev.source,
-          actorEmail: null,
-          title: ev.title,
-          description: ev.description || `Confidence: ${ev.confidence ?? 'N/A'} (${ev.confidenceTier ?? 'N/A'})`,
-          externalUrl: ev.url || null,
-          evidenceId: ev.id,
-          metadata: meta,
-        });
-      }
+          // C. IncidentEvidence records (GitHub Deployments, Commits, PRs, Sentry Errors)
+          const evidenceRecords = await tx.incidentEvidence.findMany({
+            where: {
+              incidentId,
+              addedAt: { gte: windowStart, lte: windowEnd },
+            },
+            orderBy: [{ addedAt: 'asc' }, { id: 'asc' }],
+            take: QUERY_BOUND,
+          });
 
-      // D. Team Discussion Comments
-      const commentRecords = await prisma.comment.findMany({
-        where: {
-          incidentId,
-          createdAt: { gte: windowStart, lte: windowEnd },
-        },
-        include: { user: true },
-        take: MAX_BOUND + 1,
-      });
+          if (evidenceRecords.length > MAX_REPLAY_EVENTS) {
+            anySourceOverflow = true;
+          }
 
-      if (commentRecords.length > MAX_BOUND) {
-        isTruncated = true;
-      }
+          for (const ev of evidenceRecords.slice(0, MAX_REPLAY_EVENTS)) {
+            const meta = (ev.metadata as Record<string, unknown> | null) || {};
+            const { timestamp, timestampBasis } = resolveEvidenceTimestamp(ev);
 
-      for (const c of commentRecords.slice(0, MAX_BOUND)) {
-        rawEvents.push({
-          category: ReplayCategory.COMMUNICATION,
-          categoryWeight: 40,
-          eventType: c.parentId ? 'COMMENT_REPLY' : 'COMMENT_CREATED',
-          source: EventSource.USER,
-          sourceEventId: `comment:${c.id}:COMMENT_CREATED:0`,
-          timestamp: c.createdAt,
-          actorName: c.user.name,
-          actorEmail: c.user.email,
-          title: `Comment by ${c.user.name}`,
-          description: c.content,
-          externalUrl: null,
-          evidenceId: null,
-          metadata: { commentId: c.id, parentId: c.parentId },
-        });
-      }
+            if (timestamp < windowStart || timestamp > windowEnd) {
+              continue;
+            }
 
-      // E. CorrelationRun Milestones
-      const correlationRuns = await prisma.correlationRun.findMany({
-        where: {
-          incidentId,
-          organizationId,
-          startedAt: { gte: windowStart, lte: windowEnd },
-        },
-        take: 20,
-      });
+            const sanitizedMeta = sanitizeRecursive({
+              ...meta,
+              timestampBasis,
+              evidenceType: ev.type,
+              confidence: ev.confidence,
+              confidenceTier: ev.confidenceTier,
+            }) as Record<string, unknown>;
 
-      for (const cr of correlationRuns) {
-        rawEvents.push({
-          category: ReplayCategory.CORRELATION,
-          categoryWeight: 30,
-          eventType: 'CORRELATION_COMPLETED',
-          source: EventSource.SYSTEM,
-          sourceEventId: `correlation_run:${cr.id}:CORRELATION_COMPLETED:0`,
-          timestamp: cr.completedAt || cr.startedAt,
-          actorName: 'Correlation Engine',
-          actorEmail: null,
-          title: `Phase 8 Correlation Completed (${cr.correlatedCount} evidence items)`,
-          description: `Correlated ${cr.correlatedCount} evidence signals across window`,
-          externalUrl: null,
-          evidenceId: null,
-          metadata: {
-            runId: cr.id,
-            candidateCount: cr.candidateCount,
-            correlatedCount: cr.correlatedCount,
-          },
-        });
-      }
+            const eventSource = ev.type.startsWith('GITHUB_')
+              ? EventSource.GITHUB
+              : ev.type.startsWith('SENTRY_')
+                ? EventSource.SENTRY
+                : ev.type.startsWith('SLACK_')
+                  ? EventSource.SLACK
+                  : EventSource.SYSTEM;
 
-      // F. InvestigationRun Lifecycle Milestones ONLY (Zero AI hypothesis text converted)
-      const investigationRuns = await prisma.investigationRun.findMany({
-        where: {
-          incidentId,
-          organizationId,
-          startedAt: { gte: windowStart, lte: windowEnd },
-        },
-        take: 20,
-      });
+            candidateEvents.push({
+              category: ReplayCategory.TELEMETRY,
+              categoryWeight: CATEGORY_WEIGHTS[ReplayCategory.TELEMETRY],
+              eventType: ev.type,
+              source: eventSource,
+              sourceEventId: `incident_evidence:${ev.id}:${ev.type}:0`,
+              timestamp,
+              actorName: (meta['author'] as string) ? sanitizeString(meta['author'] as string) : ev.source,
+              actorEmail: null,
+              title: cleanReplayText(ev.title),
+              description: ev.description ? cleanReplayText(ev.description) : `Confidence: ${ev.confidence ?? 'N/A'} (${ev.confidenceTier ?? 'N/A'})`,
+              externalUrl: ev.url ? sanitizeString(ev.url) : null,
+              evidenceId: ev.id,
+              metadata: sanitizedMeta,
+            });
+          }
 
-      for (const ir of investigationRuns) {
-        // Started Milestone
-        rawEvents.push({
-          category: ReplayCategory.INVESTIGATION,
-          categoryWeight: 30,
-          eventType: 'INVESTIGATION_STARTED',
-          source: EventSource.AI,
-          sourceEventId: `investigation_run:${ir.id}:INVESTIGATION_STARTED:0`,
-          timestamp: ir.startedAt,
-          actorName: 'AI Investigation Engine',
-          actorEmail: null,
-          title: 'AI Investigation Triggered',
-          description: `Provider: ${ir.providerName} (${ir.modelName})`,
-          externalUrl: null,
-          evidenceId: null,
-          metadata: { runId: ir.id, providerName: ir.providerName },
-        });
+          // D. Team Discussion Comments & Replies
+          const commentRecords = await tx.comment.findMany({
+            where: {
+              incidentId,
+              createdAt: { gte: windowStart, lte: windowEnd },
+            },
+            include: { user: true },
+            orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+            take: QUERY_BOUND,
+          });
 
-        // Completed or Failed Milestone
-        if (ir.completedAt) {
-          rawEvents.push({
-            category: ReplayCategory.INVESTIGATION,
-            categoryWeight: 30,
-            eventType: ir.status === 'COMPLETED' ? 'INVESTIGATION_COMPLETED' : 'INVESTIGATION_FAILED',
-            source: EventSource.AI,
-            sourceEventId: `investigation_run:${ir.id}:${ir.status}:1`,
-            timestamp: ir.completedAt,
-            actorName: 'AI Investigation Engine',
-            actorEmail: null,
-            title: ir.status === 'COMPLETED' ? `AI Investigation Completed (${ir.confidenceTier || 'UNCERTAIN'})` : 'AI Investigation Failed',
-            description: ir.status === 'COMPLETED' ? `Investigation finished in ${ir.latencyMs}ms` : (ir.validationError || 'Execution failed'),
-            externalUrl: null,
-            evidenceId: null,
-            metadata: {
-              runId: ir.id,
-              confidenceTier: ir.confidenceTier,
-              confidence: ir.confidence,
-              latencyMs: ir.latencyMs,
+          if (commentRecords.length > MAX_REPLAY_EVENTS) {
+            anySourceOverflow = true;
+          }
+
+          for (const c of commentRecords.slice(0, MAX_REPLAY_EVENTS)) {
+            candidateEvents.push({
+              category: ReplayCategory.COMMUNICATION,
+              categoryWeight: CATEGORY_WEIGHTS[ReplayCategory.COMMUNICATION],
+              eventType: c.parentId ? 'COMMENT_REPLY' : 'COMMENT_CREATED',
+              source: EventSource.USER,
+              sourceEventId: `comment:${c.id}:${c.parentId ? 'COMMENT_REPLY' : 'COMMENT_CREATED'}:0`,
+              timestamp: c.createdAt,
+              actorName: c.user?.name ? sanitizeString(c.user.name) : 'Responder',
+              actorEmail: null,
+              title: cleanReplayText(`Comment by ${c.user?.name || 'Responder'}`),
+              description: cleanReplayText(c.content),
+              externalUrl: null,
+              evidenceId: null,
+              metadata: { commentId: c.id, parentId: c.parentId },
+            });
+          }
+
+          // E. CorrelationRun Milestones (RUNNING, COMPLETED, FAILED)
+          const correlationRuns = await tx.correlationRun.findMany({
+            where: {
+              incidentId,
+              organizationId,
+              startedAt: { gte: windowStart, lte: windowEnd },
+            },
+            orderBy: [{ startedAt: 'asc' }, { id: 'asc' }],
+            take: RUN_SOURCE_CAP + 1,
+          });
+
+          if (correlationRuns.length > RUN_SOURCE_CAP) {
+            anySourceOverflow = true;
+          }
+
+          for (const cr of correlationRuns.slice(0, RUN_SOURCE_CAP)) {
+            candidateEvents.push({
+              category: ReplayCategory.CORRELATION,
+              categoryWeight: CATEGORY_WEIGHTS[ReplayCategory.CORRELATION],
+              eventType: 'CORRELATION_STARTED',
+              source: EventSource.SYSTEM,
+              sourceEventId: `correlation_run:${cr.id}:CORRELATION_STARTED:0`,
+              timestamp: cr.startedAt,
+              actorName: 'Correlation Engine',
+              actorEmail: null,
+              title: 'Correlation Engine Started',
+              description: `Trigger: ${cr.triggerType}`,
+              externalUrl: null,
+              evidenceId: null,
+              metadata: { runId: cr.id, triggerType: cr.triggerType },
+            });
+
+            if (cr.status === 'COMPLETED' && cr.completedAt) {
+              candidateEvents.push({
+                category: ReplayCategory.CORRELATION,
+                categoryWeight: CATEGORY_WEIGHTS[ReplayCategory.CORRELATION],
+                eventType: 'CORRELATION_COMPLETED',
+                source: EventSource.SYSTEM,
+                sourceEventId: `correlation_run:${cr.id}:CORRELATION_COMPLETED:1`,
+                timestamp: cr.completedAt,
+                actorName: 'Correlation Engine',
+                actorEmail: null,
+                title: cleanReplayText(`Correlation Engine Completed (${cr.correlatedCount} evidence items)`),
+                description: `Correlated ${cr.correlatedCount} evidence signals across window`,
+                externalUrl: null,
+                evidenceId: null,
+                metadata: {
+                  runId: cr.id,
+                  candidateCount: cr.candidateCount,
+                  correlatedCount: cr.correlatedCount,
+                },
+              });
+            } else if (cr.status === 'FAILED') {
+              candidateEvents.push({
+                category: ReplayCategory.CORRELATION,
+                categoryWeight: CATEGORY_WEIGHTS[ReplayCategory.CORRELATION],
+                eventType: 'CORRELATION_FAILED',
+                source: EventSource.SYSTEM,
+                sourceEventId: `correlation_run:${cr.id}:CORRELATION_FAILED:1`,
+                timestamp: cr.completedAt || cr.startedAt,
+                actorName: 'Correlation Engine',
+                actorEmail: null,
+                title: 'Correlation Engine Failed',
+                description: cr.error ? cleanReplayText(cr.error) : 'Execution encountered an error',
+                externalUrl: null,
+                evidenceId: null,
+                metadata: { runId: cr.id, error: cr.error ? sanitizeString(cr.error) : null },
+              });
+            }
+          }
+
+          // F. InvestigationRun Lifecycle Milestones (RUNNING, COMPLETED, FAILED)
+          const investigationRuns = await tx.investigationRun.findMany({
+            where: {
+              incidentId,
+              organizationId,
+              startedAt: { gte: windowStart, lte: windowEnd },
+            },
+            orderBy: [{ startedAt: 'asc' }, { id: 'asc' }],
+            take: RUN_SOURCE_CAP + 1,
+          });
+
+          if (investigationRuns.length > RUN_SOURCE_CAP) {
+            anySourceOverflow = true;
+          }
+
+          for (const ir of investigationRuns.slice(0, RUN_SOURCE_CAP)) {
+            candidateEvents.push({
+              category: ReplayCategory.INVESTIGATION,
+              categoryWeight: CATEGORY_WEIGHTS[ReplayCategory.INVESTIGATION],
+              eventType: 'INVESTIGATION_STARTED',
+              source: EventSource.AI,
+              sourceEventId: `investigation_run:${ir.id}:INVESTIGATION_STARTED:0`,
+              timestamp: ir.startedAt,
+              actorName: 'AI Investigation Engine',
+              actorEmail: null,
+              title: 'AI Investigation Triggered',
+              description: `Provider: ${ir.providerName} (${ir.modelName})`,
+              externalUrl: null,
+              evidenceId: null,
+              metadata: { runId: ir.id, providerName: ir.providerName },
+            });
+
+            if (ir.status === 'COMPLETED' && ir.completedAt) {
+              candidateEvents.push({
+                category: ReplayCategory.INVESTIGATION,
+                categoryWeight: CATEGORY_WEIGHTS[ReplayCategory.INVESTIGATION],
+                eventType: 'INVESTIGATION_COMPLETED',
+                source: EventSource.AI,
+                sourceEventId: `investigation_run:${ir.id}:INVESTIGATION_COMPLETED:1`,
+                timestamp: ir.completedAt,
+                actorName: 'AI Investigation Engine',
+                actorEmail: null,
+                title: cleanReplayText(`AI Investigation Completed (${ir.confidenceTier || 'UNCERTAIN'})`),
+                description: `Investigation finished in ${ir.latencyMs}ms`,
+                externalUrl: null,
+                evidenceId: null,
+                metadata: {
+                  runId: ir.id,
+                  confidenceTier: ir.confidenceTier,
+                  confidence: ir.confidence,
+                  latencyMs: ir.latencyMs,
+                },
+              });
+            } else if (ir.status === 'FAILED') {
+              candidateEvents.push({
+                category: ReplayCategory.INVESTIGATION,
+                categoryWeight: CATEGORY_WEIGHTS[ReplayCategory.INVESTIGATION],
+                eventType: 'INVESTIGATION_FAILED',
+                source: EventSource.AI,
+                sourceEventId: `investigation_run:${ir.id}:INVESTIGATION_FAILED:1`,
+                timestamp: ir.completedAt || ir.startedAt,
+                actorName: 'AI Investigation Engine',
+                actorEmail: null,
+                title: 'AI Investigation Failed',
+                description: ir.validationError ? cleanReplayText(ir.validationError) : 'Investigation execution failed',
+                externalUrl: null,
+                evidenceId: null,
+                metadata: {
+                  runId: ir.id,
+                  error: ir.validationError ? sanitizeString(ir.validationError) : 'Failed',
+                },
+              });
+            }
+          }
+
+          // Deterministic Deduplication, Category Preservation & Cap Truncation
+          const { retained: retainedEvents, isTruncated: retentionTruncated } = deduplicateAndRetainEvents(
+            candidateEvents,
+            MAX_REPLAY_EVENTS,
+          );
+
+          const isTruncated = anySourceOverflow || retentionTruncated;
+          const totalEventCount = retainedEvents.length;
+
+          // Format ReplayEvents with 1-indexed gap-free sequenceIndex
+          const replayEventCreateData: Prisma.ReplayEventCreateManyInput[] = retainedEvents.map((evt, idx) => ({
+            replayRunId: replayRun.id,
+            incidentId,
+            organizationId,
+            sequenceIndex: idx + 1, // 1-indexed, gap-free
+            category: evt.category,
+            categoryWeight: evt.categoryWeight,
+            eventType: evt.eventType,
+            source: evt.source,
+            sourceEventId: evt.sourceEventId,
+            timestamp: evt.timestamp,
+            actorName: evt.actorName,
+            actorEmail: evt.actorEmail,
+            title: evt.title,
+            description: evt.description,
+            externalUrl: evt.externalUrl,
+            evidenceId: evt.evidenceId,
+            metadata: evt.metadata as Prisma.InputJsonValue,
+          }));
+
+          if (replayEventCreateData.length > 0) {
+            await tx.replayEvent.createMany({
+              data: replayEventCreateData,
+            });
+          }
+
+          const updatedRun = await tx.replayRun.update({
+            where: { id: replayRun.id },
+            data: {
+              status: ReplayRunStatus.COMPLETED,
+              totalEventCount,
+              isTruncated,
+              completedAt: new Date(),
             },
           });
-        }
-      }
 
-      // 5. Deterministic 3-Key Sorting Algorithm
-      // Key 1: timestamp ASC
-      // Key 2: categoryWeight ASC (tie-breaker for identical timestamps)
-      // Key 3: sourceEventId ASC (lexicographical string tie-breaker)
-      rawEvents.sort((a, b) => {
-        const timeDiff = a.timestamp.getTime() - b.timestamp.getTime();
-        if (timeDiff !== 0) return timeDiff;
+          await tx.incidentEvent.create({
+            data: {
+              incidentId,
+              organizationId,
+              userId: triggeredById || null,
+              source: EventSource.SYSTEM,
+              type: 'INCIDENT_REPLAY_COMPLETED',
+              message: `Incident Replay timeline reconstructed (${updatedRun.totalEventCount} events)`,
+              metadata: {
+                automated: true,
+                replayRun: true,
+                runId: updatedRun.id,
+                totalEventCount: updatedRun.totalEventCount,
+              },
+            },
+          });
 
-        const weightDiff = a.categoryWeight - b.categoryWeight;
-        if (weightDiff !== 0) return weightDiff;
+          // Pre-commit lock ownership verification inside transaction
+          const isOwnerInTx = await verifyAndExtendLockOwnership();
+          if (!isOwnerInTx) {
+            throw new LockOwnershipLostError();
+          }
 
-        return a.sourceEventId.localeCompare(b.sourceEventId);
-      });
-
-      totalRawEvents = rawEvents.length;
-
-      // 6. Bulk Create Normalized ReplayEvents with Sequential Indexes
-      const replayEventCreateData: Prisma.ReplayEventCreateManyInput[] = rawEvents.map((evt, idx) => ({
-        replayRunId: replayRun.id,
-        incidentId,
-        organizationId,
-        sequenceIndex: idx + 1, // 1-indexed
-        category: evt.category,
-        categoryWeight: evt.categoryWeight,
-        eventType: evt.eventType,
-        source: evt.source,
-        sourceEventId: evt.sourceEventId,
-        timestamp: evt.timestamp,
-        actorName: evt.actorName,
-        actorEmail: evt.actorEmail,
-        title: evt.title,
-        description: evt.description,
-        externalUrl: evt.externalUrl,
-        evidenceId: evt.evidenceId,
-        metadata: evt.metadata as Prisma.InputJsonValue,
-      }));
-
-      if (replayEventCreateData.length > 0) {
-        await prisma.replayEvent.createMany({
-          data: replayEventCreateData,
-          skipDuplicates: true,
-        });
-      }
-
-      // Update ReplayRun to COMPLETED
-      const completedRun = await prisma.replayRun.update({
-        where: { id: replayRun.id },
-        data: {
-          status: ReplayRunStatus.COMPLETED,
-          totalEventCount: totalRawEvents,
-          isTruncated,
-          completedAt: new Date(),
+          return [updatedRun];
         },
-      });
-
-      // 7. Audit Timeline Event (Loop Prevention Flagged)
-      await prisma.incidentEvent.create({
-        data: {
-          incidentId,
-          organizationId,
-          userId: triggeredById || null,
-          source: EventSource.SYSTEM,
-          type: 'INCIDENT_REPLAY_COMPLETED',
-          message: `Incident Replay timeline reconstructed (${completedRun.totalEventCount} events)`,
-          metadata: {
-            automated: true,
-            replayRun: true,
-            runId: completedRun.id,
-            totalEventCount: completedRun.totalEventCount,
-          },
+        {
+          isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
+          maxWait: 10000,
+          timeout: 30000,
         },
-      });
+      );
 
-      // 8. Broadcast Socket.IO Event: REPLAY_COMPLETED
+      // 10. Broadcast Socket.IO Event: REPLAY_COMPLETED (only after successful commit)
       broadcastToIncident(incidentId, 'REPLAY_COMPLETED', {
         incidentId,
         runId: completedRun.id,
@@ -400,42 +545,40 @@ export class ReplayService {
 
       return { runId: completedRun.id, status: 'completed' };
     } catch (err) {
+      const sanitizedErrMsg = sanitizeString((err as Error).message || 'Incident Replay execution failed');
       logger.error({ err, incidentId }, 'Incident Replay execution failed');
 
       if (runId) {
-        await prisma.replayRun.update({
-          where: { id: runId },
-          data: {
-            status: ReplayRunStatus.FAILED,
-            error: (err as Error).message,
-            completedAt: new Date(),
-          },
-        });
+        await prisma.replayRun
+          .update({
+            where: { id: runId },
+            data: {
+              status: ReplayRunStatus.FAILED,
+              error: sanitizedErrMsg,
+              completedAt: new Date(),
+            },
+          })
+          .catch(() => undefined);
 
         broadcastToIncident(incidentId, 'REPLAY_FAILED', {
           incidentId,
           runId,
-          error: (err as Error).message,
+          error: sanitizedErrMsg,
         });
       }
 
       throw err;
     } finally {
-      // Safe Redis Lock Release
-      try {
-        if (redis.status === 'ready') {
-          const releaseScript = `
-            if redis.call("get", KEYS[1]) == ARGV[1] then
-              return redis.call("del", KEYS[1])
-            else
-              return 0
-            end
-          `;
-          await redis.eval(releaseScript, 1, lockKey, lockVal);
-        }
-      } catch {
-        // Ignore lock release error
+      if (renewalTimer) {
+        clearInterval(renewalTimer);
       }
+      ReplayService.localInFlight.delete(incidentId);
+
+      // Safe Lock Release
+      if (redisLockAcquired) {
+        await releaseDistributedLock(lockKey, lockVal);
+      }
+
     }
   }
 
@@ -450,15 +593,46 @@ export class ReplayService {
 
     const latestRun = await prisma.replayRun.findFirst({
       where: { incidentId, organizationId },
-      orderBy: { startedAt: 'desc' },
+      orderBy: [{ startedAt: 'desc' }, { id: 'asc' }],
       include: {
         events: {
           orderBy: { sequenceIndex: 'asc' },
+          take: MAX_REPLAY_EVENTS,
         },
       },
     });
 
-    return { incidentId, latestRun };
+    const latestCompletedRun = await prisma.replayRun.findFirst({
+      where: { incidentId, organizationId, status: ReplayRunStatus.COMPLETED },
+      orderBy: [{ startedAt: 'desc' }, { id: 'asc' }],
+      include: {
+        events: {
+          orderBy: { sequenceIndex: 'asc' },
+          take: MAX_REPLAY_EVENTS,
+        },
+      },
+    });
+
+    const latestFailedRun = await prisma.replayRun.findFirst({
+      where: { incidentId, organizationId, status: ReplayRunStatus.FAILED },
+      orderBy: [{ startedAt: 'desc' }, { id: 'asc' }],
+    });
+
+    const isRunning = latestRun?.status === ReplayRunStatus.RUNNING;
+
+    return {
+      incidentId,
+      latestRun: latestCompletedRun || latestRun,
+      latestCompletedRun,
+      latestFailure: latestFailedRun && latestFailedRun.completedAt
+        ? {
+            runId: latestFailedRun.id,
+            error: latestFailedRun.error || 'Execution failed',
+            completedAt: latestFailedRun.completedAt.toISOString(),
+          }
+        : null,
+      isRunning,
+    };
   }
 
   public static async getReplayRuns(organizationId: string, incidentId: string) {
@@ -472,8 +646,8 @@ export class ReplayService {
 
     return prisma.replayRun.findMany({
       where: { incidentId, organizationId },
-      orderBy: { startedAt: 'desc' },
-      take: 20,
+      orderBy: [{ startedAt: 'desc' }, { id: 'asc' }],
+      take: 50,
     });
   }
 }

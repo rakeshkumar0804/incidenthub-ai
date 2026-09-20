@@ -4,7 +4,7 @@
 
 ![CI](https://github.com/rakeshkumar0804/incidenthub-ai/actions/workflows/ci.yml/badge.svg)
 ![Stack](https://img.shields.io/badge/stack-React%20%7C%20Node%20%7C%20PostgreSQL%20%7C%20Redis-blue)
-![Tests](https://img.shields.io/badge/tests-236%2F236%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-594%2F594%20passing-brightgreen)
 
 ---
 
@@ -116,9 +116,9 @@ Validated locally at the current baseline:
 
 ```
 npm run typecheck   → PASS
-npm run lint         → PASS (0 warnings, --max-warnings 0)
-npm run test          → PASS (17/17 suites, 236/236 tests)
-npm run build         → PASS
+npm run lint        → PASS (0 warnings, --max-warnings 0)
+npm run test        → PASS (26/26 suites, 594/594 tests)
+npm run build       → PASS
 ```
 
 Test coverage includes RBAC boundary tests, cross-tenant isolation checks, webhook idempotency, correlation-engine determinism, and Redis lock/concurrency behavior.
@@ -139,6 +139,8 @@ npm run db:migrate
 # start API + web in dev mode
 npm run dev
 ```
+
+The API server runs on port `4000` (health probes at `http://localhost:4000/health/liveness` and `http://localhost:4000/health/readiness`), and the web client runs on `http://localhost:5173`.
 
 ## Environment Variables
 

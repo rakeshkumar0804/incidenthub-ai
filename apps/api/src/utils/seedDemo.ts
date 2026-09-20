@@ -25,17 +25,39 @@ import {
 
 import bcrypt from 'bcryptjs';
 
+function isLocalDatabaseUrl(urlStr?: string): boolean {
+  if (!urlStr) return false;
+  try {
+    const parsed = new URL(urlStr);
+    const host = parsed.hostname.toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === 'postgres';
+  } catch {
+    return false;
+  }
+}
+
 export async function runDemoSeeding(prisma: PrismaClient): Promise<{
   message: string;
   organizations: string[];
   incidentsCreated: number;
 }> {
-  const passwordHash = await bcrypt.hash('Password123!', 10);
+  if (process.env['NODE_ENV'] === 'production') {
+    throw new Error('Refusing to run demo seeding in production environment (NODE_ENV=production)');
+  }
+
+  if (process.env['ALLOW_DEMO_SEED'] !== 'true') {
+    throw new Error('Demo seeding disabled. Set ALLOW_DEMO_SEED=true in environment to permit seeding.');
+  }
+
+  const dbUrl = process.env['DATABASE_URL'];
+  if (!isLocalDatabaseUrl(dbUrl)) {
+    throw new Error('Refusing to run demo seeding: DATABASE_URL must point to a local host (localhost, 127.0.0.1, or postgres). Remote and cloud databases (Neon, Render, etc.) are strictly prohibited.');
+  }
+
+  const demoPass = process.env['DEMO_USER_PASSWORD'] || 'DemoSecurePass2026!';
+  const passwordHash = await bcrypt.hash(demoPass, 10);
 
   // 1. Demo Users
-  const existingUsers = await prisma.user.findMany({ take: 10 });
-  const primaryOwner = existingUsers.length > 0 ? existingUsers[0] : null;
-
   const demoAdmin = await prisma.user.upsert({
     where: { email: 'alex.chen@acme.dev' },
     update: {},
@@ -69,8 +91,7 @@ export async function runDemoSeeding(prisma: PrismaClient): Promise<{
     },
   });
 
-  // 2. Identify all target organizations to seed
-  // Always seed Acme Engineering AND any existing organizations in the database
+  // 2. Identify dedicated demo organization
   const acmeOrg = await prisma.organization.upsert({
     where: { slug: 'acme-engineering' },
     update: {
@@ -84,20 +105,17 @@ export async function runDemoSeeding(prisma: PrismaClient): Promise<{
     },
   });
 
-  const allOrgs = await prisma.organization.findMany();
-  const targetOrgs = allOrgs.length > 0 ? allOrgs : [acmeOrg];
-
+  const targetOrgs = [acmeOrg];
   let totalIncidentsCreated = 0;
 
   for (const org of targetOrgs) {
-    // Add demo users + existing users as members of this org
+    // Add demo users strictly to Acme Engineering
     const allUsersToLink = [
-      ...(primaryOwner ? [{ id: primaryOwner.id, role: OrgRole.OWNER }] : []),
       { id: demoAdmin.id, role: OrgRole.ADMIN },
       { id: demoResponder.id, role: OrgRole.RESPONDER },
       { id: demoViewer.id, role: OrgRole.VIEWER },
-      ...existingUsers.map((u) => ({ id: u.id, role: OrgRole.OWNER })),
     ];
+
 
     for (const u of allUsersToLink) {
       await prisma.organizationMember.upsert({
@@ -875,7 +893,7 @@ export async function runDemoSeeding(prisma: PrismaClient): Promise<{
   }
 
   return {
-    message: 'Demo dataset seeded successfully across all organizations!',
+    message: 'Demo dataset seeded successfully for Acme Engineering!',
     organizations: targetOrgs.map((o) => o.name),
     incidentsCreated: totalIncidentsCreated,
   };

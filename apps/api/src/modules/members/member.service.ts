@@ -55,6 +55,11 @@ export class MemberService {
     const requesterRole = requesterMember.role as unknown as OrgRole;
     const targetRole = targetMember.role as unknown as OrgRole;
 
+    // Only OWNER can modify an OWNER
+    if (targetRole === OrgRole.OWNER && requesterRole !== OrgRole.OWNER) {
+      throw new ForbiddenError('Only an OWNER may modify another OWNER');
+    }
+
     // Privilege escalation protection: Only OWNER can assign OWNER role
     if (input.role === OrgRole.OWNER && requesterRole !== OrgRole.OWNER) {
       throw new ForbiddenError('Only an Organization OWNER can grant or transfer OWNER status');
@@ -91,7 +96,7 @@ export class MemberService {
     };
   }
 
-  static async removeMember(organizationId: string, targetMemberId: string) {
+  static async removeMember(organizationId: string, targetMemberId: string, requesterUserId: string) {
     const targetMember = await prisma.organizationMember.findFirst({
       where: { id: targetMemberId, organizationId },
     });
@@ -100,10 +105,28 @@ export class MemberService {
       throw new NotFoundError('Organization member not found');
     }
 
+    const requesterMember = await prisma.organizationMember.findUnique({
+      where: {
+        organizationId_userId: {
+          organizationId,
+          userId: requesterUserId,
+        },
+      },
+    });
+
+    if (!requesterMember) {
+      throw new ForbiddenError('Access denied');
+    }
+
+    const requesterRole = requesterMember.role as unknown as OrgRole;
     const targetRole = targetMember.role as unknown as OrgRole;
 
-    // Sole owner removal protection
+    // Sole owner removal & non-owner removing owner protection
     if (targetRole === OrgRole.OWNER) {
+      if (requesterRole !== OrgRole.OWNER) {
+        throw new ForbiddenError('Only an OWNER may remove another OWNER');
+      }
+
       const ownerCount = await prisma.organizationMember.count({
         where: { organizationId, role: OrgRole.OWNER },
       });

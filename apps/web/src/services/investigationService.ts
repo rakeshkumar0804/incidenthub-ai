@@ -1,13 +1,18 @@
 import { apiClient } from '../lib/axios';
-import type { ApiSuccess, InvestigationRunDto, TriggerInvestigationInput } from '@incidenthub/shared';
+import type {
+  ApiSuccess,
+  InvestigationRunDto,
+  TriggerInvestigationInput,
+  GetLatestInvestigationResponseDto,
+} from '@incidenthub/shared';
 
 export const investigationService = {
   getLatestInvestigation: async (
     organizationId: string,
     incidentId: string,
-  ): Promise<{ incidentId: string; latestRun: InvestigationRunDto | null }> => {
+  ): Promise<GetLatestInvestigationResponseDto> => {
     const res = await apiClient.get<
-      ApiSuccess<{ incidentId: string; latestRun: InvestigationRunDto | null }>
+      ApiSuccess<GetLatestInvestigationResponseDto>
     >(`/organizations/${organizationId}/incidents/${incidentId}/investigation`);
     return res.data.data;
   },

@@ -9,8 +9,8 @@ export interface RawEvidenceCitationInput {
 
 export interface RawActionItemInput {
   title: string;
-  description?: string;
-  priority?: 'HIGH' | 'MEDIUM' | 'LOW';
+  description?: string | null;
+  priority?: 'HIGH' | 'MEDIUM' | 'LOW' | 'CRITICAL';
 }
 
 export interface RawPostmortemLLMOutput {
@@ -23,7 +23,7 @@ export interface RawPostmortemLLMOutput {
   resolution: string;
   wentWell: string;
   wentWrong: string;
-  uncertainty?: string;
+  uncertainty?: string | null;
   evidenceReferences: RawEvidenceCitationInput[];
   actionItems: RawActionItemInput[];
 }
