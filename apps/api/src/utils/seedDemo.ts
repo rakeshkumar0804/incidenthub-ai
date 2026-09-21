@@ -1,3 +1,19 @@
+/**
+ * ============================================================================
+ * IncidentHub AI — Acme Engineering Demo Seeding Logic
+ * ============================================================================
+ *
+ * PURPOSE:
+ * Contains the deterministic entity generation for the "Acme Engineering" demo
+ * organization used to showcase the IncidentHub AI platform (RBAC roles,
+ * multi-severity incidents, postmortems, and correlation evidence).
+ *
+ * DO NOT DELETE:
+ * This module is essential for reproducing the demo environment in local and
+ * portfolio setups.
+ * ============================================================================
+ */
+
 import type { PrismaClient } from '@prisma/client';
 import {
   OrgRole,

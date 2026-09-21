@@ -1,3 +1,18 @@
+/**
+ * ============================================================================
+ * IncidentHub AI — Demo Organization Seeding Runner
+ * ============================================================================
+ *
+ * PURPOSE:
+ * Seeds the canonical "Acme Engineering" demo organization for showcase and
+ * portfolio demonstration purposes.
+ *
+ * DO NOT DELETE:
+ * This script is essential for maintaining the recruiter/portfolio demonstration
+ * workspace. Do not remove or disable during cleanup or polishing passes.
+ * ============================================================================
+ */
+
 import { PrismaClient } from '@prisma/client';
 import { runDemoSeeding } from '../apps/api/src/utils/seedDemo';
 
