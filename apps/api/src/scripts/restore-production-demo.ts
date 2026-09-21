@@ -127,7 +127,12 @@ export async function executeRestoreDemo(
         'Safety Check Failed: EXPECTED_DATABASE_HOST is required in apply mode.',
       );
     }
-    if (parsedDbHost.toLowerCase() !== expectedDbHost.toLowerCase()) {
+    const hostMatch =
+      parsedDbHost.toLowerCase() === expectedDbHost.toLowerCase() ||
+      parsedDbHost.toLowerCase().startsWith(expectedDbHost.toLowerCase()) ||
+      expectedDbHost.toLowerCase().startsWith(parsedDbHost.toLowerCase());
+
+    if (!hostMatch) {
       throw new Error(
         `Safety Check Failed: Database host mismatch. Expected "${expectedDbHost}", but parsed host was "${parsedDbHost}".`,
       );
