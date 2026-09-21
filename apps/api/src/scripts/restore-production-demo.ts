@@ -974,7 +974,7 @@ export async function executeRestoreDemo(
           });
         }
       }
-    });
+    }, { maxWait: 20000, timeout: 60000 });
   }
 
   // Step 3: Capture Post-State of all non-Acme organizations
